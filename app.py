@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -13,7 +14,27 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageOps
-from streamlit_drawable_canvas import st_canvas
+
+import vendor_drawable_canvas as _drawable_canvas_module
+from vendor_drawable_canvas import st_canvas
+
+# The canvas component normally asks Streamlit's MediaFileManager for a URL to
+# the background image (a path like "/media/<hash>.png"). On Streamlit
+# Community Cloud the app is served behind a proxy path prefix (e.g.
+# "/~/+/") that a root-relative media path doesn't include, so the request
+# never reaches the app and the canvas renders with no background image.
+# Embedding the image as a data URL sidesteps the MediaFileManager/proxy path
+# entirely. This requires the accompanying frontend patch vendored in
+# vendor_drawable_canvas/ (see its README) that stops prefixing the URL with
+# the page origin, which would otherwise corrupt a data URL.
+def _background_image_to_data_url(image, *_args, **_kwargs) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+_drawable_canvas_module.image_to_url = _background_image_to_data_url
 
 from roi_core import (
     SUPPORTED_COLORMAPS,
