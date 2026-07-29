@@ -208,13 +208,34 @@ def _rotate_points(
     return output
 
 
-def _polygon_points_from_object(obj: dict[str, Any]) -> list[tuple[float, float]]:
-    obj_type = str(obj.get("type", "")).lower()
+def _origin_fraction(value: Any, axis: str) -> float:
+    """Convert a Fabric.js originX/originY value to a 0..1 fraction of width/height."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).lower()
+    if axis == "x":
+        return {"left": 0.0, "center": 0.5, "right": 1.0}.get(text, 0.0)
+    return {"top": 0.0, "center": 0.5, "bottom": 1.0}.get(text, 0.0)
+
+
+def _bbox_corner(obj: dict[str, Any], width: float, height: float) -> tuple[float, float]:
+    """Fabric.js positions `left`/`top` at the point named by originX/originY
+    (the freehand and polygon tools use "center", not the top-left corner)."""
     left = float(obj.get("left", 0.0))
     top = float(obj.get("top", 0.0))
+    corner_x = left - _origin_fraction(obj.get("originX", "left"), "x") * width
+    corner_y = top - _origin_fraction(obj.get("originY", "top"), "y") * height
+    return corner_x, corner_y
+
+
+def _polygon_points_from_object(obj: dict[str, Any]) -> list[tuple[float, float]]:
+    obj_type = str(obj.get("type", "")).lower()
     scale_x = float(obj.get("scaleX", 1.0))
     scale_y = float(obj.get("scaleY", 1.0))
     angle = float(obj.get("angle", 0.0))
+    width = float(obj.get("width", 0.0)) * scale_x
+    height = float(obj.get("height", 0.0)) * scale_y
+    corner_x, corner_y = _bbox_corner(obj, width, height)
 
     if obj_type == "polygon":
         raw = [(float(p["x"]), float(p["y"])) for p in obj.get("points", [])]
@@ -222,7 +243,7 @@ def _polygon_points_from_object(obj: dict[str, Any]) -> list[tuple[float, float]
             return []
         min_x = min(x for x, _ in raw)
         min_y = min(y for _, y in raw)
-        points = [(left + (x - min_x) * scale_x, top + (y - min_y) * scale_y) for x, y in raw]
+        points = [(corner_x + (x - min_x) * scale_x, corner_y + (y - min_y) * scale_y) for x, y in raw]
     elif obj_type == "path":
         raw: list[tuple[float, float]] = []
         for command in obj.get("path", []):
@@ -234,21 +255,19 @@ def _polygon_points_from_object(obj: dict[str, Any]) -> list[tuple[float, float]
             return []
         min_x = min(x for x, _ in raw)
         min_y = min(y for _, y in raw)
-        points = [(left + (x - min_x) * scale_x, top + (y - min_y) * scale_y) for x, y in raw]
+        points = [(corner_x + (x - min_x) * scale_x, corner_y + (y - min_y) * scale_y) for x, y in raw]
     elif obj_type == "rect":
-        width = float(obj.get("width", 0.0)) * scale_x
-        height = float(obj.get("height", 0.0)) * scale_y
         points = [
-            (left, top),
-            (left + width, top),
-            (left + width, top + height),
-            (left, top + height),
+            (corner_x, corner_y),
+            (corner_x + width, corner_y),
+            (corner_x + width, corner_y + height),
+            (corner_x, corner_y + height),
         ]
     else:
         return []
 
-    center_x = left + float(obj.get("width", 0.0)) * scale_x / 2.0
-    center_y = top + float(obj.get("height", 0.0)) * scale_y / 2.0
+    center_x = corner_x + width / 2.0
+    center_y = corner_y + height / 2.0
     return _rotate_points(points, angle, (center_x, center_y))
 
 
@@ -267,13 +286,12 @@ def object_to_canvas_mask(
             return None
         draw.polygon(points, fill=255)
     elif obj_type in {"circle", "ellipse"}:
-        left = float(obj.get("left", 0.0))
-        top = float(obj.get("top", 0.0))
         width = float(obj.get("width", obj.get("radius", 0.0) * 2.0))
         height = float(obj.get("height", obj.get("radius", 0.0) * 2.0))
         width *= float(obj.get("scaleX", 1.0))
         height *= float(obj.get("scaleY", 1.0))
-        draw.ellipse((left, top, left + width, top + height), fill=255)
+        corner_x, corner_y = _bbox_corner(obj, width, height)
+        draw.ellipse((corner_x, corner_y, corner_x + width, corner_y + height), fill=255)
     else:
         return None
     return np.asarray(image, dtype=np.uint8) > 0
