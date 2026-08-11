@@ -15,6 +15,7 @@ from scipy.spatial import cKDTree
 SUPPORTED_COLORMAPS = (
     "turbo",
     "jet",
+    "rainbow",
     "inferno",
     "magma",
     "plasma",
