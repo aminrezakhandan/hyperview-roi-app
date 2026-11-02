@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -37,13 +38,23 @@ def _background_image_to_data_url(image, *_args, **_kwargs) -> str:
 _drawable_canvas_module.image_to_url = _background_image_to_data_url
 
 from roi_core import (
+    FOOT_REGION_NAMES,
+    HEEL_SIDES,
     SUPPORTED_COLORMAPS,
+    canvas_size,
     decode_false_color,
+    default_morphology_radii,
     ensure_rgb_uint8,
+    flatten_alpha,
     masks_from_canvas,
+    masks_to_fabric_drawing,
     normalize_to_rgb,
     overlay_masks,
     roi_geometry,
+    segment_feet,
+    split_foot_regions,
+    strict_threshold,
+    trim_nan_border,
     summary_statistics,
 )
 
@@ -74,8 +85,17 @@ def mask_bytes(mask: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
+MAX_IMAGE_PIXELS = 40_000_000  # keeps memory bounded on small hosts (e.g. Community Cloud)
+
+
 def read_raster(payload: bytes) -> tuple[np.ndarray, np.ndarray, dict]:
-    image = ImageOps.exif_transpose(Image.open(io.BytesIO(payload)))
+    image = Image.open(io.BytesIO(payload))
+    if image.width * image.height > MAX_IMAGE_PIXELS:
+        raise ValueError(
+            f"Image is too large ({image.width} x {image.height}); "
+            f"limit is {MAX_IMAGE_PIXELS:,} pixels. Crop or downscale it first."
+        )
+    image = ImageOps.exif_transpose(image)
     metadata = {
         "format": image.format,
         "width": image.width,
@@ -86,7 +106,7 @@ def read_raster(payload: bytes) -> tuple[np.ndarray, np.ndarray, dict]:
         scalar = np.asarray(image, dtype=float)
         display = normalize_to_rgb(scalar)
         return scalar, display, metadata
-    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    rgb = flatten_alpha(image)  # composites transparency on white instead of exposing hidden colours
     return rgb, rgb, metadata
 
 
@@ -220,6 +240,7 @@ def csv_configuration(payload: bytes) -> tuple[np.ndarray, np.ndarray, dict]:
         array = numeric.to_numpy(dtype=float)
         if not np.isfinite(array).any():
             raise ValueError("No numeric pixel values were found in the CSV matrix.")
+        array = trim_nan_border(array)  # text header row / label column (e.g. "File:", "Frame 1")
         metadata = {"csv_layout": mode, "rows": array.shape[0], "columns": array.shape[1]}
     else:
         frame = pd.read_csv(io.BytesIO(payload))
@@ -404,7 +425,7 @@ if apply_remap:
         st.error("Mapped minimum and maximum must differ.")
         st.stop()
     if data_max == data_min:
-        values = np.full_like(values, float(target_min), dtype=float)
+        values = np.where(np.isfinite(values), float(target_min), np.nan)
     else:
         values = (
             float(target_min)
@@ -455,7 +476,94 @@ with control_right:
         st.session_state.canvas_revision = 0
     if st.button("Clear all contours", use_container_width=True):
         st.session_state.canvas_revision += 1
+        st.session_state.pop("auto_foot", None)
         st.rerun()
+
+with st.expander("Automatic foot regions: hindfoot / midfoot / forefoot (plantar thermal, exploratory)"):
+    st.caption(
+        "Segments the warmest connected area as the foot (Otsu or manual threshold), finds its long "
+        "axis, and splits the length from the heel into regions. The result is loaded onto the canvas "
+        "as ordinary editable polygons: always check and correct them. Plantar views, roughly "
+        "upright, with the foot warmer than the background. Crop out legends, hands and bedding first."
+    )
+    auto_left, auto_right = st.columns(2)
+    with auto_left:
+        auto_feet = st.radio("Feet in image", (1, 2), horizontal=True)
+        auto_heel = st.selectbox("Heel is at the ... of the image", HEEL_SIDES, index=0)
+        threshold_mode = st.radio(
+            "Foot threshold",
+            ("Automatic (Otsu)", "Strict (exclude warm bedding)", "Manual"),
+            horizontal=True,
+            help="Strict uses a higher two-level Otsu seed, cuts thin bridges, then grows back a few "
+            "pixels; use it when warm bedding/clothing touches the feet. It can trim cool toe tips.",
+        )
+        manual_threshold = None
+        if threshold_mode == "Manual":
+            manual_threshold = st.number_input(
+                "Threshold (foot > this value)", value=float(np.nanmedian(finite)) if finite.size else 0.0, format="%.4f"
+            )
+    with auto_right:
+        hind_end = st.number_input("Hindfoot ends at (% of foot length from heel)", 5.0, 90.0, 33.0, step=1.0)
+        mid_end = st.number_input("Midfoot ends at (% of foot length from heel)", 10.0, 95.0, 66.0, step=1.0)
+    if st.button("Generate foot regions"):
+        try:
+            if not hind_end < mid_end:
+                raise ValueError("Hindfoot boundary must be smaller than the midfoot boundary.")
+            if threshold_mode.startswith("Strict"):
+                base_cut, core_cut = strict_threshold(values)
+                open_r, grow_r = default_morphology_radii(values.shape)
+                foot_masks, used_threshold = segment_feet(
+                    values,
+                    threshold=base_cut,
+                    core_threshold=core_cut,
+                    n_feet=int(auto_feet),
+                    opening_radius=open_r,
+                    grow_radius=grow_r,
+                )
+            else:
+                foot_masks, used_threshold = segment_feet(
+                    values, threshold=manual_threshold, n_feet=int(auto_feet)
+                )
+            if not foot_masks:
+                raise ValueError("No foot-sized warm region found. Adjust the threshold or crop the image.")
+            region_masks, labels = [], []
+            for foot_number, foot_mask in enumerate(foot_masks, start=1):
+                parts = split_foot_regions(foot_mask, auto_heel, (hind_end / 100.0, mid_end / 100.0))
+                for name in FOOT_REGION_NAMES:
+                    region_masks.append(parts[name])
+                    labels.append(f"Foot {foot_number} {name.lower()}")
+            drawing_width, drawing_height = canvas_size(width, height)
+            st.session_state.auto_foot = {
+                "file_hash": file_hash,
+                "drawing": masks_to_fabric_drawing(
+                    region_masks,
+                    canvas_width=drawing_width,
+                    canvas_height=drawing_height,
+                    original_width=width,
+                    original_height=height,
+                ),
+                "labels": labels,
+                "threshold": used_threshold,
+                "feet_found": len(foot_masks),
+                "feet_requested": int(auto_feet),
+            }
+            st.session_state.canvas_revision += 1
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+auto_foot = st.session_state.get("auto_foot")
+if auto_foot is not None and auto_foot["file_hash"] != file_hash:
+    auto_foot = None
+if auto_foot is not None:
+    st.info(
+        f"Auto foot regions loaded (threshold {auto_foot['threshold']:.4g}; "
+        f"{auto_foot['feet_found']} of {auto_foot['feet_requested']} requested feet found). "
+        "ROI order: " + "; ".join(f"ROI {i} = {lab}" for i, lab in enumerate(auto_foot["labels"], start=1))
+        + ". Labels apply only until you add, delete or reorder contours."
+    )
+    if auto_foot["feet_found"] < auto_foot["feet_requested"]:
+        st.warning("Fewer feet than requested were segmented (feet may touch or be too cool); check the outlines.")
 
 drawing_modes = {
     "Polygon": "polygon",
@@ -464,11 +572,10 @@ drawing_modes = {
     "Circle": "circle",
     "Transform": "transform",
 }
-canvas_width = min(900, width)
-canvas_height = max(1, int(round(height * canvas_width / width)))
+canvas_width, canvas_height = canvas_size(width, height)
 canvas_background = Image.fromarray(ensure_rgb_uint8(source_display)).resize(
     (canvas_width, canvas_height),
-    Image.Resampling.BILINEAR,
+    Image.Resampling.NEAREST if canvas_width > width else Image.Resampling.BILINEAR,
 )
 canvas_result = st_canvas(
     fill_color="rgba(255, 30, 30, 0.22)",
@@ -479,6 +586,7 @@ canvas_result = st_canvas(
     height=canvas_height,
     width=canvas_width,
     drawing_mode=drawing_modes[drawing_mode_label],
+    initial_drawing=copy.deepcopy(auto_foot["drawing"]) if auto_foot is not None else None,
     display_toolbar=True,
     key=f"roi_canvas_{file_hash}_{st.session_state.canvas_revision}",
 )
@@ -497,7 +605,7 @@ rows.append(
     {
         "region": "Whole image",
         **whole_stats,
-        "roi_pixels": int(np.isfinite(values).size),
+        "roi_pixels": int(values.size),
         "roi_fraction": 1.0,
         "area": width * height * row_spacing * column_spacing,
         "perimeter": 2 * (height * row_spacing + width * column_spacing),
