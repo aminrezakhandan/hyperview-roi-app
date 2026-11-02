@@ -536,3 +536,28 @@ def test_flir_style_csv_text_header_parses_to_clean_grid():
     frame = pd.read_csv(io.StringIO(text), header=None)
     grid = trim_nan_border(frame.apply(pd.to_numeric, errors="coerce").to_numpy(float))
     assert grid.shape == (2, 3) and grid[0, 0] == 20.1 and grid[1, 2] == 20.6
+
+
+def test_split_hand_drawn_polygon_into_three_exact_regions():
+    """Draw-then-split workflow: canvas polygon -> mask -> hind/mid/fore partition."""
+    th = np.linspace(0, 2 * np.pi, 60, endpoint=False)
+    pts = np.column_stack([100 + 40 * np.cos(th), 150 + 85 * np.sin(th)])
+    lo = pts.min(0)
+    obj = {"type": "polygon", "originX": "left", "originY": "top", "left": lo[0], "top": lo[1],
+           "width": np.ptp(pts[:, 0]), "height": np.ptp(pts[:, 1]),
+           "points": [{"x": float(a), "y": float(b)} for a, b in pts - lo]}
+    mask = masks_from_canvas({"objects": [obj]}, canvas_width=300, canvas_height=300,
+                             original_width=300, original_height=300)[0]
+    regions = split_foot_regions(mask, "bottom", (0.4, 0.7))
+    stacked = np.stack(list(regions.values()))
+    assert (stacked.sum(0) <= 1).all() and np.array_equal(stacked.any(0), mask)
+    rows = {n: np.nonzero(m)[0].mean() for n, m in regions.items()}
+    assert rows["Hindfoot"] > rows["Midfoot"] > rows["Forefoot"]  # heel at bottom of image
+    length = np.ptp(np.nonzero(mask)[0]) + 1
+    assert np.ptp(np.nonzero(regions["Hindfoot"])[0]) + 1 == pytest.approx(0.4 * length, abs=3)
+
+
+def test_otsu_threshold_gives_near_perfect_synthetic_foot_mask():
+    img, truth = synthetic_foot()
+    masks, _ = segment_feet(img, threshold=otsu_threshold(img))
+    assert (masks[0] & truth).sum() / (masks[0] | truth).sum() > 0.99
