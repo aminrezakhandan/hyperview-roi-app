@@ -481,3 +481,58 @@ def test_contour_area_exact_on_upscaled_small_csv_canvas():
     cw, ch = canvas_size(80, 60)  # 900 x 675: factor 11.25
     obj = {"type": "rect", "left": 112.5, "top": 112.5, "width": 337.5, "height": 225}  # 30 x 20 px
     assert _area(obj, cw, ch, 80, 60) == 600
+
+
+def test_strict_mode_excludes_warm_bedding_touching_foot():
+    from roi_core import default_morphology_radii, strict_threshold
+    img, truth = synthetic_foot(h=300, w=300, cx=100, cy=150, ry=110, rx=40, warm=33.0, cold=22.0)
+    yy, xx = np.mgrid[0:300, 0:300]
+    bedding = (xx > 135) & (xx < 280) & (yy > 100) & (yy < 250)  # warm blanket, 27 C, touching the foot
+    img = np.where(bedding & ~truth, 27.0, img)
+    plain, _ = segment_feet(img)
+    assert plain[0].sum() > 1.5 * truth.sum()  # default lumps blanket + foot together
+    base, core = strict_threshold(img)
+    assert core > base
+    opening, grow = default_morphology_radii(img.shape)
+    strict, used = segment_feet(img, threshold=base, core_threshold=core, opening_radius=opening, grow_radius=grow)
+    assert used == core
+    iou = (strict[0] & truth).sum() / (strict[0] | truth).sum()
+    assert iou > 0.9
+
+
+def test_strict_threshold_falls_back_on_two_level_image():
+    from roi_core import strict_threshold
+    img, _ = synthetic_foot()
+    base, core = strict_threshold(img)
+    assert core == base
+
+
+def test_opening_removes_thin_bridge_between_blobs():
+    img = np.full((100, 100), 20.0)
+    img[10:50, 10:50] = 30.0
+    img[10:50, 60:90] = 30.0
+    img[29:31, 49:61] = 30.0  # 2-px-tall bridge joining the blobs
+    joined, _ = segment_feet(img, threshold=25, n_feet=2)
+    assert len(joined) == 1
+    cut, _ = segment_feet(img, threshold=25, n_feet=2, opening_radius=3)
+    assert len(cut) == 2
+
+
+def test_trim_nan_border_removes_text_header_row_and_label_column():
+    from roi_core import trim_nan_border
+    core = np.arange(12, dtype=float).reshape(3, 4)
+    padded = np.full((5, 6), np.nan)
+    padded[1:4, 1:5] = core
+    assert np.array_equal(trim_nan_border(padded), core)
+    interior = core.copy(); interior[1, 1] = np.nan  # interior NaN must stay in place
+    assert np.isnan(trim_nan_border(interior)[1, 1]) and trim_nan_border(interior).shape == (3, 4)
+    assert trim_nan_border(np.full((2, 2), np.nan)).shape == (2, 2)
+
+
+def test_flir_style_csv_text_header_parses_to_clean_grid():
+    import pandas as pd
+    from roi_core import trim_nan_border
+    text = "File:,C:\\x\\a.jpg,,\nFrame 1,20.1,20.2,20.3\n,20.4,20.5,20.6\n"
+    frame = pd.read_csv(io.StringIO(text), header=None)
+    grid = trim_nan_border(frame.apply(pd.to_numeric, errors="coerce").to_numpy(float))
+    assert grid.shape == (2, 3) and grid[0, 0] == 20.1 and grid[1, 2] == 20.6

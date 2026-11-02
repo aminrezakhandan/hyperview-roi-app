@@ -43,6 +43,7 @@ from roi_core import (
     SUPPORTED_COLORMAPS,
     canvas_size,
     decode_false_color,
+    default_morphology_radii,
     ensure_rgb_uint8,
     flatten_alpha,
     masks_from_canvas,
@@ -52,6 +53,8 @@ from roi_core import (
     roi_geometry,
     segment_feet,
     split_foot_regions,
+    strict_threshold,
+    trim_nan_border,
     summary_statistics,
 )
 
@@ -237,6 +240,7 @@ def csv_configuration(payload: bytes) -> tuple[np.ndarray, np.ndarray, dict]:
         array = numeric.to_numpy(dtype=float)
         if not np.isfinite(array).any():
             raise ValueError("No numeric pixel values were found in the CSV matrix.")
+        array = trim_nan_border(array)  # text header row / label column (e.g. "File:", "Frame 1")
         metadata = {"csv_layout": mode, "rows": array.shape[0], "columns": array.shape[1]}
     else:
         frame = pd.read_csv(io.BytesIO(payload))
@@ -486,7 +490,13 @@ with st.expander("Automatic foot regions: hindfoot / midfoot / forefoot (plantar
     with auto_left:
         auto_feet = st.radio("Feet in image", (1, 2), horizontal=True)
         auto_heel = st.selectbox("Heel is at the ... of the image", HEEL_SIDES, index=0)
-        threshold_mode = st.radio("Foot threshold", ("Automatic (Otsu)", "Manual"), horizontal=True)
+        threshold_mode = st.radio(
+            "Foot threshold",
+            ("Automatic (Otsu)", "Strict (exclude warm bedding)", "Manual"),
+            horizontal=True,
+            help="Strict uses a higher two-level Otsu seed, cuts thin bridges, then grows back a few "
+            "pixels; use it when warm bedding/clothing touches the feet. It can trim cool toe tips.",
+        )
         manual_threshold = None
         if threshold_mode == "Manual":
             manual_threshold = st.number_input(
@@ -499,9 +509,21 @@ with st.expander("Automatic foot regions: hindfoot / midfoot / forefoot (plantar
         try:
             if not hind_end < mid_end:
                 raise ValueError("Hindfoot boundary must be smaller than the midfoot boundary.")
-            foot_masks, used_threshold = segment_feet(
-                values, threshold=manual_threshold, n_feet=int(auto_feet)
-            )
+            if threshold_mode.startswith("Strict"):
+                base_cut, core_cut = strict_threshold(values)
+                open_r, grow_r = default_morphology_radii(values.shape)
+                foot_masks, used_threshold = segment_feet(
+                    values,
+                    threshold=base_cut,
+                    core_threshold=core_cut,
+                    n_feet=int(auto_feet),
+                    opening_radius=open_r,
+                    grow_radius=grow_r,
+                )
+            else:
+                foot_masks, used_threshold = segment_feet(
+                    values, threshold=manual_threshold, n_feet=int(auto_feet)
+                )
             if not foot_masks:
                 raise ValueError("No foot-sized warm region found. Adjust the threshold or crop the image.")
             region_masks, labels = [], []

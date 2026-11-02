@@ -37,6 +37,24 @@ def canvas_size(width: int, height: int, max_width: int = 900, max_height: int =
     return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
 
+def trim_nan_border(array: np.ndarray) -> np.ndarray:
+    """Drop leading/trailing rows and columns that contain no finite value.
+
+    Camera CSV exports often start with a text header row (``File: ...``) and a
+    label column (``Frame 1``); after numeric coercion these are all-NaN and would
+    otherwise shift every pixel (and any contour) by one row/column.
+    """
+    data = np.asarray(array, dtype=float)
+    if data.ndim != 2:
+        raise ValueError("trim_nan_border expects a 2-D array.")
+    finite = np.isfinite(data)
+    rows = np.flatnonzero(finite.any(axis=1))
+    cols = np.flatnonzero(finite.any(axis=0))
+    if rows.size == 0:
+        return data
+    return data[rows[0] : rows[-1] + 1, cols[0] : cols[-1] + 1]
+
+
 def normalize_to_rgb(
     values: np.ndarray,
     *,
@@ -505,19 +523,57 @@ def otsu_threshold(values: np.ndarray, bins: int = 256) -> float:
     return float(centers[int(best[0] + best[-1]) // 2])
 
 
+def strict_threshold(values: np.ndarray) -> tuple[float, float]:
+    """Return (base, core) thresholds: Otsu, and the midpoint between it and a
+    second Otsu level computed on the pixels above it.
+
+    The core threshold sits above warm intermediate material (bedding, clothing)
+    that the base threshold lumps in with the foot. Falls back to the base value
+    when the upper class cannot be split further.
+    """
+    base = otsu_threshold(values)
+    data = np.asarray(values, dtype=float)
+    upper = data[np.isfinite(data) & (data > base)]
+    try:
+        second = otsu_threshold(upper)
+    except ValueError:
+        return base, base
+    return base, (base + second) / 2.0 if second > base else base
+
+
+def default_morphology_radii(shape: tuple[int, int]) -> tuple[int, int]:
+    """(opening_radius, grow_radius) in pixels, scaled to the image size."""
+    short_side = min(shape)
+    return max(1, int(round(short_side * 0.0125))), max(1, int(round(short_side * 0.017)))
+
+
+def _disk(radius: int) -> np.ndarray:
+    yy, xx = np.mgrid[-radius : radius + 1, -radius : radius + 1]
+    return (xx**2 + yy**2) <= radius**2
+
+
 def segment_feet(
     values: np.ndarray,
     *,
     threshold: float | None = None,
+    core_threshold: float | None = None,
     n_feet: int = 1,
     min_area_fraction: float = 0.005,
+    opening_radius: int = 0,
+    grow_radius: int = 0,
 ) -> tuple[list[np.ndarray], float]:
-    """Segment the warmest connected blob(s): returns (masks left-to-right, threshold).
+    """Segment the warmest connected blob(s): returns (masks left-to-right, threshold used).
 
-    Pixels with value > threshold (NaN excluded) are kept, holes filled, and the
-    `n_feet` largest components larger than `min_area_fraction` of the image kept.
+    Default: pixels with value > threshold (Otsu if None; NaN excluded).
+    Strict mode (`core_threshold` given): seed from pixels above the higher
+    `core_threshold`, optionally cut thin bridges with a morphological opening of
+    `opening_radius` px, then grow the seed back out by `grow_radius` px but only
+    over pixels above `threshold`. This keeps edges/heel/toes while dropping
+    warm material that merely touches the foot.
+    Holes are filled and the `n_feet` largest components larger than
+    `min_area_fraction` of the image are kept.
     """
-    from scipy.ndimage import binary_fill_holes, label
+    from scipy.ndimage import binary_dilation, binary_fill_holes, binary_opening, label
 
     data = np.asarray(values, dtype=float)
     if data.ndim != 2:
@@ -525,15 +581,27 @@ def segment_feet(
     if n_feet < 1:
         raise ValueError("n_feet must be at least 1.")
     cut = otsu_threshold(data) if threshold is None else float(threshold)
-    candidate = np.isfinite(data) & (data > cut)
+    finite = np.isfinite(data)
+    candidate = finite & (data > cut)
+    if core_threshold is not None:
+        core = finite & (data > float(core_threshold))
+        if opening_radius > 0:
+            core = binary_opening(core, structure=_disk(int(opening_radius)))
+        if grow_radius > 0:
+            candidate = binary_dilation(core, structure=_disk(int(grow_radius))) & candidate
+        else:
+            candidate = core
+    elif opening_radius > 0:
+        candidate = binary_opening(candidate, structure=_disk(int(opening_radius)))
+    used = cut if core_threshold is None else float(core_threshold)
     labels, count = label(candidate)
     if count == 0:
-        return [], cut
+        return [], used
     sizes = np.bincount(labels.ravel())[1:]
     order = [i for i in np.argsort(sizes)[::-1] if sizes[i] >= min_area_fraction * data.size][:n_feet]
     masks = [binary_fill_holes(labels == (i + 1)) for i in order]
     masks.sort(key=lambda m: float(np.nonzero(m)[1].mean()))
-    return masks, cut
+    return masks, used
 
 
 def split_foot_regions(

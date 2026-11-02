@@ -5,6 +5,8 @@ A Streamlit app (runs locally or on Streamlit Community Cloud) that accepts:
 - PNG, JPEG, TIFF, and BMP images
 - DICOM images, including common multiframe datasets
 - CSV pixel maps stored either as a numeric matrix or as `x, y, value` rows
+  (text header rows/label columns such as `File:` / `Frame 1` in camera exports
+  are trimmed automatically)
 
 It calculates whole-image statistics, lets the user draw multiple polygon,
 freehand, rectangular, or circular contours, and calculates the same statistics
@@ -78,6 +80,12 @@ regions**. The app:
    disjoint and exactly cover the foot mask;
 4. loads them onto the canvas as ordinary polygons, so they can be dragged,
    corrected or deleted, and they flow through the same statistics and export.
+
+**Threshold modes:** *Automatic (Otsu)* keeps everything warmer than the
+background/foot split; *Strict (exclude warm bedding)* seeds from a higher
+two-level Otsu threshold, cuts thin bridges (morphological opening), then grows
+back a few pixels over the Otsu mask. Use Strict when warm bedding or clothing
+touches the feet; it can trim cool toe tips, so check the forefoot outline.
 
 This is pure NumPy/SciPy: no model, no network calls, no tokens, and it runs in
 well under a second. Limits: it assumes a roughly upright plantar view with the
