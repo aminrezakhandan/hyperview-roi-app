@@ -73,8 +73,8 @@ Decoding a false-color picture is an **estimate**, not a measurement.
   recovers values to within about one LUT step (range/255; tests assert < 0.25
   on a 20-degree scale). Real screenshots do much worse: a vendor palette that
   is not exactly the Matplotlib one, JPEG compression, scaling/anti-aliasing,
-  and rendered overlays/text shift colours. Expect errors on the order of
-  **~2 C** (or ~2-3 % of the displayed range) for thermal screenshots, and that
+  and rendered overlays/text shift colours. The project's experience is errors on the order of
+  **~2 C** for thermal screenshots (not a validated bound), and that
   error is **not reduced** by averaging over an ROI because it is largely
   systematic (colormap mismatch).
 - The displayed minimum/maximum must be typed in correctly; a wrong range
