@@ -40,6 +40,7 @@ from roi_core import (
     SUPPORTED_COLORMAPS,
     decode_false_color,
     ensure_rgb_uint8,
+    flatten_alpha,
     masks_from_canvas,
     normalize_to_rgb,
     overlay_masks,
@@ -74,8 +75,17 @@ def mask_bytes(mask: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
+MAX_IMAGE_PIXELS = 40_000_000  # keeps memory bounded on small hosts (e.g. Community Cloud)
+
+
 def read_raster(payload: bytes) -> tuple[np.ndarray, np.ndarray, dict]:
-    image = ImageOps.exif_transpose(Image.open(io.BytesIO(payload)))
+    image = Image.open(io.BytesIO(payload))
+    if image.width * image.height > MAX_IMAGE_PIXELS:
+        raise ValueError(
+            f"Image is too large ({image.width} x {image.height}); "
+            f"limit is {MAX_IMAGE_PIXELS:,} pixels. Crop or downscale it first."
+        )
+    image = ImageOps.exif_transpose(image)
     metadata = {
         "format": image.format,
         "width": image.width,
@@ -86,7 +96,7 @@ def read_raster(payload: bytes) -> tuple[np.ndarray, np.ndarray, dict]:
         scalar = np.asarray(image, dtype=float)
         display = normalize_to_rgb(scalar)
         return scalar, display, metadata
-    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    rgb = flatten_alpha(image)  # composites transparency on white instead of exposing hidden colours
     return rgb, rgb, metadata
 
 
@@ -404,7 +414,7 @@ if apply_remap:
         st.error("Mapped minimum and maximum must differ.")
         st.stop()
     if data_max == data_min:
-        values = np.full_like(values, float(target_min), dtype=float)
+        values = np.where(np.isfinite(values), float(target_min), np.nan)
     else:
         values = (
             float(target_min)
@@ -497,7 +507,7 @@ rows.append(
     {
         "region": "Whole image",
         **whole_stats,
-        "roi_pixels": int(np.isfinite(values).size),
+        "roi_pixels": int(values.size),
         "roi_fraction": 1.0,
         "area": width * height * row_spacing * column_spacing,
         "perimeter": 2 * (height * row_spacing + width * column_spacing),

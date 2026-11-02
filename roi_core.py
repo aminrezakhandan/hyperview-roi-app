@@ -58,22 +58,42 @@ def ensure_rgb_uint8(image: np.ndarray) -> np.ndarray:
         return normalize_to_rgb(arr)
     if arr.ndim != 3 or arr.shape[-1] not in (3, 4):
         raise ValueError(f"Unsupported display image shape: {arr.shape}")
+    is_float = arr.dtype.kind == "f"
     arr = arr[..., :3].astype(float)
     finite = np.isfinite(arr)
     if not finite.any():
         return np.zeros((*arr.shape[:2], 3), dtype=np.uint8)
     low = np.nanmin(arr[finite])
     high = np.nanmax(arr[finite])
-    if low >= 0 and high <= 255:
-        out = np.nan_to_num(arr, nan=0.0)
-    elif low >= 0 and high <= 1:
-        out = np.nan_to_num(arr, nan=0.0) * 255
+    clean = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if is_float and low >= 0 and high <= 1:
+        # Float images in 0..1 (checked before 0..255 so they are not truncated to 0/1).
+        out = clean * 255
+    elif low >= 0 and high <= 255:
+        out = clean
     else:
         p1, p99 = np.nanpercentile(arr[finite], [1, 99])
         if p99 <= p1:
             p99 = p1 + 1.0
-        out = np.clip((arr - p1) / (p99 - p1), 0, 1) * 255
-    return np.clip(out, 0, 255).astype(np.uint8)
+        out = np.clip((clean - p1) / (p99 - p1), 0, 1) * 255
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
+def flatten_alpha(image: Image.Image, background: tuple[int, int, int] = (255, 255, 255)) -> np.ndarray:
+    """Return an RGB uint8 array, compositing any transparency onto `background`.
+
+    Plain ``convert("RGB")`` discards alpha and exposes the hidden colour of
+    transparent pixels (often black), which several colormaps would then decode
+    as a real low value. White is rejected by the default mismatch
+    threshold for every supported colormap except ``hot``, whose top end is white.
+    """
+    has_alpha = image.mode in {"RGBA", "LA", "PA", "La", "RGBa"} or "transparency" in image.info
+    if has_alpha:
+        rgba = image.convert("RGBA")
+        canvas = Image.new("RGBA", rgba.size, (*background, 255))
+        canvas.alpha_composite(rgba)
+        return np.asarray(canvas.convert("RGB"), dtype=np.uint8)
+    return np.asarray(image.convert("RGB"), dtype=np.uint8)
 
 
 def decode_false_color(
@@ -92,16 +112,36 @@ def decode_false_color(
     Returns (values, valid_mask, nearest_RGB_distance). This is an estimate and
     is only valid when the source uses the selected colormap and numeric range.
     """
-    source = ensure_rgb_uint8(rgb).astype(float)
+    if cmap_name not in colormaps:
+        raise ValueError(f"Unknown colormap: {cmap_name!r}")
+    if not (np.isfinite(value_min) and np.isfinite(value_max)):
+        raise ValueError("value_min and value_max must be finite numbers.")
+    if lut_size < 2:
+        raise ValueError("lut_size must be at least 2.")
+    source = ensure_rgb_uint8(rgb)
+    if source.size == 0:
+        raise ValueError("Cannot decode an empty image.")
     positions = np.linspace(0.0, 1.0, lut_size)
     if reverse:
         positions = positions[::-1]
     lut = np.asarray(colormaps[cmap_name](positions, bytes=True)[..., :3], dtype=float)
     tree = cKDTree(lut)
-    distances, indices = tree.query(source.reshape(-1, 3), workers=-1)
-    normalized = indices.reshape(source.shape[:2]) / float(lut_size - 1)
+    # Query each distinct colour once: screenshots contain far fewer unique
+    # colours than pixels, which keeps memory/time low for large images.
+    packed = (
+        (source[..., 0].astype(np.uint32) << 16)
+        | (source[..., 1].astype(np.uint32) << 8)
+        | source[..., 2].astype(np.uint32)
+    )
+    unique_colors, inverse = np.unique(packed.ravel(), return_inverse=True)
+    unique_rgb = np.stack(
+        [(unique_colors >> 16) & 255, (unique_colors >> 8) & 255, unique_colors & 255], axis=1
+    ).astype(float)
+    unique_dist, unique_idx = tree.query(unique_rgb)
+    inverse = inverse.reshape(source.shape[:2])
+    distance_map = unique_dist[inverse]
+    normalized = unique_idx[inverse] / float(lut_size - 1)
     values = value_min + normalized * (value_max - value_min)
-    distance_map = distances.reshape(source.shape[:2])
     if max_rgb_distance is None:
         valid = np.ones(source.shape[:2], dtype=bool)
     else:
