@@ -6,7 +6,7 @@ import math
 from typing import Any, Iterable
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 from matplotlib import colormaps
 from scipy.ndimage import binary_erosion
 from scipy.spatial import cKDTree
@@ -269,6 +269,36 @@ def _bbox_corner(obj: dict[str, Any], width: float, height: float) -> tuple[floa
     return corner_x, corner_y
 
 
+def _flatten_path(commands: Iterable[Any], steps: int = 12) -> list[tuple[float, float]]:
+    """Flatten Fabric.js path commands (M, L, Q, C, Z) into polyline vertices.
+
+    Freehand strokes are quadratic Beziers; using only their control points as
+    vertices (as before) misplaces the boundary, so curves are sampled instead.
+    """
+    points: list[tuple[float, float]] = []
+    current: tuple[float, float] | None = None
+    t = np.linspace(0.0, 1.0, steps + 1)[1:]
+    for command in commands:
+        op = str(command[0]).upper()
+        nums = [float(v) for v in command[1:] if isinstance(v, (int, float))]
+        if op in ("M", "L") and len(nums) >= 2:
+            current = (nums[-2], nums[-1])
+            points.append(current)
+        elif op == "Q" and len(nums) >= 4 and current is not None:
+            (x0, y0), (cx, cy), (x1, y1) = current, (nums[0], nums[1]), (nums[2], nums[3])
+            bx = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t**2 * x1
+            by = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t**2 * y1
+            points.extend(zip(bx.tolist(), by.tolist()))
+            current = (x1, y1)
+        elif op == "C" and len(nums) >= 6 and current is not None:
+            (x0, y0) = current
+            bx = (1-t)**3*x0 + 3*(1-t)**2*t*nums[0] + 3*(1-t)*t**2*nums[2] + t**3*nums[4]
+            by = (1-t)**3*y0 + 3*(1-t)**2*t*nums[1] + 3*(1-t)*t**2*nums[3] + t**3*nums[5]
+            points.extend(zip(bx.tolist(), by.tolist()))
+            current = (nums[4], nums[5])
+    return points
+
+
 def _polygon_points_from_object(obj: dict[str, Any]) -> list[tuple[float, float]]:
     obj_type = str(obj.get("type", "")).lower()
     scale_x = float(obj.get("scaleX", 1.0))
@@ -286,12 +316,7 @@ def _polygon_points_from_object(obj: dict[str, Any]) -> list[tuple[float, float]
         min_y = min(y for _, y in raw)
         points = [(corner_x + (x - min_x) * scale_x, corner_y + (y - min_y) * scale_y) for x, y in raw]
     elif obj_type == "path":
-        raw: list[tuple[float, float]] = []
-        for command in obj.get("path", []):
-            numbers = command[1:]
-            for index in range(0, len(numbers) - 1, 2):
-                if isinstance(numbers[index], (int, float)) and isinstance(numbers[index + 1], (int, float)):
-                    raw.append((float(numbers[index]), float(numbers[index + 1])))
+        raw = _flatten_path(obj.get("path", []))
         if len(raw) < 3:
             return []
         min_x = min(x for x, _ in raw)
@@ -312,30 +337,68 @@ def _polygon_points_from_object(obj: dict[str, Any]) -> list[tuple[float, float]
     return _rotate_points(points, angle, (center_x, center_y))
 
 
-def object_to_canvas_mask(
-    obj: dict[str, Any],
-    canvas_width: int,
-    canvas_height: int,
-) -> np.ndarray | None:
-    """Rasterize one supported Fabric.js canvas object to a boolean mask."""
+def object_to_polygon(obj: dict[str, Any]) -> list[tuple[float, float]]:
+    """Return a supported Fabric.js object as polygon vertices in canvas pixels.
+
+    Circles/ellipses are approximated by a 1440-vertex polygon (area error
+    < 1e-5). Unsupported or degenerate objects return an empty list.
+    """
     obj_type = str(obj.get("type", "")).lower()
-    image = Image.new("L", (canvas_width, canvas_height), 0)
-    draw = ImageDraw.Draw(image)
     if obj_type in {"polygon", "path", "rect"}:
         points = _polygon_points_from_object(obj)
-        if len(points) < 3:
-            return None
-        draw.polygon(points, fill=255)
-    elif obj_type in {"circle", "ellipse"}:
-        width = float(obj.get("width", obj.get("radius", 0.0) * 2.0))
-        height = float(obj.get("height", obj.get("radius", 0.0) * 2.0))
-        width *= float(obj.get("scaleX", 1.0))
-        height *= float(obj.get("scaleY", 1.0))
+        return points if len(points) >= 3 else []
+    if obj_type in {"circle", "ellipse"}:
+        scale_x = float(obj.get("scaleX", 1.0))
+        scale_y = float(obj.get("scaleY", 1.0))
+        width = float(obj.get("width", obj.get("radius", 0.0) * 2.0)) * scale_x
+        height = float(obj.get("height", obj.get("radius", 0.0) * 2.0)) * scale_y
+        if width <= 0 or height <= 0:
+            return []
         corner_x, corner_y = _bbox_corner(obj, width, height)
-        draw.ellipse((corner_x, corner_y, corner_x + width, corner_y + height), fill=255)
-    else:
-        return None
-    return np.asarray(image, dtype=np.uint8) > 0
+        cx, cy = corner_x + width / 2.0, corner_y + height / 2.0
+        theta = np.linspace(0.0, 2.0 * np.pi, 1440, endpoint=False)
+        ring = list(zip((cx + width / 2.0 * np.cos(theta)).tolist(), (cy + height / 2.0 * np.sin(theta)).tolist()))
+        return _rotate_points(ring, float(obj.get("angle", 0.0)), (cx, cy))
+    return []
+
+
+def rasterize_polygon(
+    points: Iterable[tuple[float, float]],
+    height: int,
+    width: int,
+    *,
+    x_scale: float = 1.0,
+    y_scale: float = 1.0,
+    chunk_pixels: int = 2_000_000,
+) -> np.ndarray:
+    """Boolean mask of pixels whose *centre* lies inside the polygon.
+
+    Vertices are multiplied by x_scale/y_scale (canvas -> source pixels) and the
+    polygon is sampled directly on the source grid, so the mask area is an
+    unbiased estimate of the drawn area at source resolution (pixel (i, j) covers
+    [j, j+1) x [i, i+1), centre at (j+0.5, i+0.5)).
+    """
+    from matplotlib.path import Path as MplPath
+
+    scaled = np.asarray([(x * x_scale, y * y_scale) for x, y in points], dtype=float)
+    mask = np.zeros((height, width), dtype=bool)
+    if len(scaled) < 3 or not np.isfinite(scaled).all():
+        return mask
+    x0 = max(int(np.floor(scaled[:, 0].min() - 0.5)), 0)
+    x1 = min(int(np.ceil(scaled[:, 0].max() - 0.5)) + 1, width)
+    y0 = max(int(np.floor(scaled[:, 1].min() - 0.5)), 0)
+    y1 = min(int(np.ceil(scaled[:, 1].max() - 0.5)) + 1, height)
+    if x1 <= x0 or y1 <= y0:
+        return mask
+    path = MplPath(scaled)
+    xs = np.arange(x0, x1) + 0.5
+    rows_per_chunk = max(1, chunk_pixels // (x1 - x0))
+    for start in range(y0, y1, rows_per_chunk):
+        stop = min(start + rows_per_chunk, y1)
+        yy, xx = np.meshgrid(np.arange(start, stop) + 0.5, xs, indexing="ij")
+        inside = path.contains_points(np.column_stack([xx.ravel(), yy.ravel()]))
+        mask[start:stop, x0:x1] = inside.reshape(stop - start, x1 - x0)
+    return mask
 
 
 def masks_from_canvas(
@@ -346,19 +409,24 @@ def masks_from_canvas(
     original_width: int,
     original_height: int,
 ) -> list[np.ndarray]:
-    """Convert all supported drawn objects into masks at source-image resolution."""
-    if not json_data:
+    """Convert all supported drawn objects into masks at source-image resolution.
+
+    Contours are rasterized directly on the source grid (not on the downscaled
+    canvas and then resized), so reported pixel counts/areas reflect the drawn
+    shape rather than canvas-resolution rounding.
+    """
+    if not json_data or canvas_width <= 0 or canvas_height <= 0:
         return []
+    x_scale = original_width / float(canvas_width)
+    y_scale = original_height / float(canvas_height)
     masks = []
     for obj in json_data.get("objects", []):
-        canvas_mask = object_to_canvas_mask(obj, canvas_width, canvas_height)
-        if canvas_mask is None or not canvas_mask.any():
+        polygon = object_to_polygon(obj)
+        if not polygon:
             continue
-        resized = Image.fromarray(canvas_mask.astype(np.uint8) * 255).resize(
-            (original_width, original_height),
-            resample=Image.Resampling.NEAREST,
+        mask = rasterize_polygon(
+            polygon, original_height, original_width, x_scale=x_scale, y_scale=y_scale
         )
-        mask = np.asarray(resized, dtype=np.uint8) > 0
         if mask.any():
             masks.append(mask)
     return masks

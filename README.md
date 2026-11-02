@@ -52,6 +52,15 @@ shown in the terminal, usually `http://localhost:8501`.
 7. Download the ZIP package containing statistics, contour definitions, masks,
    the overlay, and optional calibrated values.
 
+Contours are rasterized directly on the source-resolution pixel grid: a pixel
+is inside an ROI when its centre lies inside the drawn shape. ROI area is
+`pixels x row spacing x column spacing`, accurate to about +/-1 pixel along the
+boundary (curved or diagonal edges are unbiased; shapes whose edges fall exactly
+on pixel centres can differ by about half a boundary pixel). The **Combined ROI**
+is the union, so overlapping contours are not double counted. Perimeter is
+measured along pixel edges and therefore overestimates diagonal and curved
+boundaries (about 27 % for a circle); use area and equivalent diameter for size.
+
 Freehand contours are automatically closed. Polygon contours are preferred for
 repeatability and easier visual verification.
 

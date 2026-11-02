@@ -241,3 +241,86 @@ def test_geometry_empty_and_l_shape():
     g = roi_geometry(mask)
     assert g["roi_pixels"] == 5 and g["perimeter"] == 10.0
     assert (g["bbox_x_min"], g["bbox_y_min"], g["bbox_x_max"], g["bbox_y_max"]) == (0, 0, 1, 2)
+
+
+# ---- Contour -> mask area accuracy ----------------------------------------
+
+from roi_core import masks_from_canvas, object_to_polygon  # noqa: E402
+
+
+def _area(obj, cw, ch, ow, oh):
+    masks = masks_from_canvas({"objects": [obj]}, canvas_width=cw, canvas_height=ch,
+                              original_width=ow, original_height=oh)
+    return int(masks[0].sum()) if masks else 0
+
+
+def test_rect_area_exact_at_source_resolution():
+    obj = {"type": "rect", "left": 10, "top": 10, "width": 40, "height": 40}
+    assert _area(obj, 100, 100, 100, 100) == 1600  # was 1681 (boundary pixels counted)
+    assert _area(obj, 900, 900, 1800, 1800) == 6400  # 2x upscale: 80 x 80
+
+
+def test_non_square_scaling_uses_separate_axes():
+    obj = {"type": "rect", "left": 0, "top": 0, "width": 50, "height": 20}
+    assert _area(obj, 100, 40, 300, 200) == 150 * 100
+
+
+def test_circle_area_within_half_percent():
+    obj = {"type": "circle", "left": 200, "top": 200, "width": 200, "height": 200,
+           "originX": "center", "originY": "center"}
+    area = _area(obj, 400, 400, 400, 400)
+    assert area == pytest.approx(np.pi * 100**2, rel=0.005)
+
+
+def test_rotated_rect_and_scaled_ellipse_area():
+    rect = {"type": "rect", "left": 100, "top": 100, "width": 100, "height": 40, "angle": 37,
+            "originX": "center", "originY": "center"}
+    assert _area(rect, 300, 300, 300, 300) == pytest.approx(4000, rel=0.02)
+    ell = {"type": "circle", "left": 150, "top": 150, "width": 50, "height": 50, "scaleX": 2, "scaleY": 1,
+           "originX": "center", "originY": "center"}
+    assert _area(ell, 300, 300, 300, 300) == pytest.approx(np.pi * 50 * 25, rel=0.01)
+
+
+def test_polygon_area_matches_shoelace_for_random_shapes():
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        # random star-shaped polygon, irrational-ish coordinates (no pixel-centre ties)
+        n = int(rng.integers(5, 12))
+        # evenly spaced angles with jitter < half a step keeps the polygon simple (star-shaped)
+        ang = (np.arange(n) + rng.uniform(-0.4, 0.4, n)) * 2 * np.pi / n
+        rad = rng.uniform(30, 90, n)
+        pts = np.column_stack([150 + rad * np.cos(ang), 150 + rad * np.sin(ang)])
+        x, y = pts[:, 0], pts[:, 1]
+        shoelace = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+        mx, my = x.min(), y.min()
+        obj = {"type": "polygon", "left": mx, "top": my, "width": x.max() - mx, "height": y.max() - my,
+               "points": [{"x": float(a - mx), "y": float(b - my)} for a, b in pts]}
+        assert _area(obj, 300, 300, 300, 300) == pytest.approx(shoelace, rel=0.01)
+
+
+def test_freehand_path_curves_are_flattened():
+    # Quadratic strokes: control points at the corners of a square, end points at midpoints.
+    obj = {"type": "path", "left": 0, "top": 0, "width": 100, "height": 100,
+           "path": [["M", 50, 0], ["Q", 100, 0, 100, 50], ["Q", 100, 100, 50, 100],
+                    ["Q", 0, 100, 0, 50], ["Q", 0, 0, 50, 0]]}
+    # Rounded diamond: area = 5000 + curved bulge, strictly between diamond and square.
+    area = _area(obj, 100, 100, 100, 100)
+    assert 5000 < area < 10000 and area == pytest.approx(7000 - 0, abs=1500)
+    assert len(object_to_polygon(obj)) > 20
+
+
+def test_overlapping_contours_not_double_counted_in_union():
+    a = {"type": "rect", "left": 0, "top": 0, "width": 40, "height": 40}
+    b = {"type": "rect", "left": 20, "top": 20, "width": 40, "height": 40}
+    masks = masks_from_canvas({"objects": [a, b]}, canvas_width=100, canvas_height=100,
+                              original_width=100, original_height=100)
+    union = np.logical_or.reduce(masks)
+    assert [int(m.sum()) for m in masks] == [1600, 1600] and int(union.sum()) == 1600 + 1600 - 400
+
+
+def test_contour_partly_outside_image_is_clipped_and_degenerate_ignored():
+    out = {"type": "rect", "left": 90, "top": 90, "width": 40, "height": 40}
+    assert _area(out, 100, 100, 100, 100) == 100
+    assert _area({"type": "rect", "left": 5, "top": 5, "width": 0, "height": 10}, 100, 100, 100, 100) == 0
+    assert _area({"type": "rect", "left": 200, "top": 200, "width": 10, "height": 10}, 100, 100, 100, 100) == 0
+    assert _area({"type": "line"}, 100, 100, 100, 100) == 0
