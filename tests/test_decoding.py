@@ -464,3 +464,20 @@ def test_regions_round_trip_through_editable_canvas_polygons():
         masks_to_fabric_drawing(regions, canvas_width=200, canvas_height=300, original_width=400, original_height=600),
         canvas_width=200, canvas_height=300, original_width=400, original_height=600)
     assert big[1].sum() == pytest.approx(regions[1].sum(), rel=0.03)
+
+
+def test_canvas_size_scales_small_maps_up_and_large_down():
+    from roi_core import canvas_size
+    assert canvas_size(80, 60) == (900, 675)  # small CSV grid is drawable
+    assert canvas_size(4000, 3000) == (900, 675)
+    assert canvas_size(60, 1000) == (72, 1200)  # tall maps limited by height
+    assert canvas_size(1, 1) == (900, 900) and canvas_size(900, 600) == (900, 600)
+    with pytest.raises(ValueError):
+        canvas_size(0, 10)
+
+
+def test_contour_area_exact_on_upscaled_small_csv_canvas():
+    from roi_core import canvas_size
+    cw, ch = canvas_size(80, 60)  # 900 x 675: factor 11.25
+    obj = {"type": "rect", "left": 112.5, "top": 112.5, "width": 337.5, "height": 225}  # 30 x 20 px
+    assert _area(obj, cw, ch, 80, 60) == 600

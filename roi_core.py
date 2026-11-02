@@ -25,6 +25,18 @@ SUPPORTED_COLORMAPS = (
 )
 
 
+def canvas_size(width: int, height: int, max_width: int = 900, max_height: int = 1200) -> tuple[int, int]:
+    """Display size for the drawing canvas: scaled to fit max_width x max_height.
+
+    Small pixel maps (e.g. 80 x 60 CSV grids) are scaled *up* so they can be
+    drawn on; large images are scaled down. Aspect ratio is preserved.
+    """
+    if width < 1 or height < 1:
+        raise ValueError("Image dimensions must be positive.")
+    scale = min(max_width / width, max_height / height)
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+
 def normalize_to_rgb(
     values: np.ndarray,
     *,

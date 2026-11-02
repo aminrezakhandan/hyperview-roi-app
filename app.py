@@ -41,6 +41,7 @@ from roi_core import (
     FOOT_REGION_NAMES,
     HEEL_SIDES,
     SUPPORTED_COLORMAPS,
+    canvas_size,
     decode_false_color,
     ensure_rgb_uint8,
     flatten_alpha,
@@ -509,8 +510,7 @@ with st.expander("Automatic foot regions: hindfoot / midfoot / forefoot (plantar
                 for name in FOOT_REGION_NAMES:
                     region_masks.append(parts[name])
                     labels.append(f"Foot {foot_number} {name.lower()}")
-            drawing_width = min(900, width)
-            drawing_height = max(1, int(round(height * drawing_width / width)))
+            drawing_width, drawing_height = canvas_size(width, height)
             st.session_state.auto_foot = {
                 "file_hash": file_hash,
                 "drawing": masks_to_fabric_drawing(
@@ -550,11 +550,10 @@ drawing_modes = {
     "Circle": "circle",
     "Transform": "transform",
 }
-canvas_width = min(900, width)
-canvas_height = max(1, int(round(height * canvas_width / width)))
+canvas_width, canvas_height = canvas_size(width, height)
 canvas_background = Image.fromarray(ensure_rgb_uint8(source_display)).resize(
     (canvas_width, canvas_height),
-    Image.Resampling.BILINEAR,
+    Image.Resampling.NEAREST if canvas_width > width else Image.Resampling.BILINEAR,
 )
 canvas_result = st_canvas(
     fill_color="rgba(255, 30, 30, 0.22)",
