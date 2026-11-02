@@ -64,6 +64,31 @@ boundaries (about 27 % for a circle); use area and equivalent diameter for size.
 Freehand contours are automatically closed. Polygon contours are preferred for
 repeatability and easier visual verification.
 
+## Automatic foot regions (plantar thermal, exploratory)
+
+Open **Automatic foot regions** above the canvas, choose how many feet are in
+the image and which side of the image the heel is on, then press **Generate foot
+regions**. The app:
+
+1. keeps the warmest connected area(s) (Otsu threshold, or a manual threshold),
+   fills holes and ignores small blobs (< 0.5 % of the image);
+2. finds each foot's long axis (principal axis of its pixels);
+3. splits the projected length from the heel into hindfoot / midfoot / forefoot
+   (default 0-33 % / 33-66 % / 66-100 %, adjustable), so the three regions are
+   disjoint and exactly cover the foot mask;
+4. loads them onto the canvas as ordinary polygons, so they can be dragged,
+   corrected or deleted, and they flow through the same statistics and export.
+
+This is pure NumPy/SciPy: no model, no network calls, no tokens, and it runs in
+well under a second. Limits: it assumes a roughly upright plantar view with the
+foot warmer than its surroundings, and splitting by fractions of length is an
+approximation of the anatomical boundaries, not a landmark-based one. Legends,
+hands, bedding or warm objects touching the foot, and feet that touch each other,
+can break the segmentation, so crop first and always verify the outlines. It has
+only been tested on synthetic shapes; validate it on your own images (for
+example Dice overlap against manual contours) before relying on it, and report
+results from it as exploratory.
+
 ## Supported colormaps (false-color decoding)
 
 `turbo`, `jet`, `rainbow`, `inferno`, `magma`, `plasma`, `viridis`, `hot`,

@@ -324,3 +324,143 @@ def test_contour_partly_outside_image_is_clipped_and_degenerate_ignored():
     assert _area({"type": "rect", "left": 5, "top": 5, "width": 0, "height": 10}, 100, 100, 100, 100) == 0
     assert _area({"type": "rect", "left": 200, "top": 200, "width": 10, "height": 10}, 100, 100, 100, 100) == 0
     assert _area({"type": "line"}, 100, 100, 100, 100) == 0
+
+
+# ---- Automatic foot regions (synthetic shapes only) -----------------------
+
+from roi_core import (  # noqa: E402
+    FOOT_REGION_NAMES,
+    masks_to_fabric_drawing,
+    otsu_threshold,
+    segment_feet,
+    split_foot_regions,
+)
+
+
+def synthetic_foot(h=300, w=200, cx=100, cy=150, ry=120, rx=45, angle=0.0, warm=33.0, cold=22.0, noise=0.0, seed=0):
+    """Elongated warm ellipse (toes up, heel at bottom) on a cool background."""
+    yy, xx = np.mgrid[0:h, 0:w]
+    c, s = np.cos(np.radians(angle)), np.sin(np.radians(angle))
+    u = (xx - cx) * c + (yy - cy) * s
+    v = -(xx - cx) * s + (yy - cy) * c
+    inside = (u / rx) ** 2 + (v / ry) ** 2 <= 1
+    img = np.where(inside, warm, cold).astype(float)
+    if noise:
+        img = img + np.random.default_rng(seed).normal(0, noise, img.shape)
+    return img, inside
+
+
+def test_otsu_separates_two_levels():
+    img, _ = synthetic_foot(noise=0.5)
+    assert 24 < otsu_threshold(img) < 31
+    with pytest.raises(ValueError):
+        otsu_threshold(np.ones((4, 4)))
+    with pytest.raises(ValueError):
+        otsu_threshold(np.full((4, 4), np.nan))
+
+
+def test_otsu_threshold_midway_between_two_levels():
+    img, _ = synthetic_foot(warm=34.0, cold=22.0)
+    assert otsu_threshold(img) == pytest.approx(28.0, abs=0.2)
+    img[0, :] = 22.4  # slightly warmer background rows must stay below the threshold
+    assert segment_feet(img)[0][0][0, :].sum() == 0
+
+
+def test_segment_single_foot_recovers_shape():
+    img, truth = synthetic_foot(noise=0.5)
+    masks, cut = segment_feet(img)
+    assert len(masks) == 1 and 24 < cut < 31
+    iou = (masks[0] & truth).sum() / (masks[0] | truth).sum()
+    assert iou > 0.99
+
+
+def test_segment_two_feet_sorted_left_to_right_and_noise_ignored():
+    left, _ = synthetic_foot(w=400, cx=100)
+    right, _ = synthetic_foot(w=400, cx=300, rx=40)
+    img = np.maximum(left, right)
+    img[5, 5] = 40.0  # isolated hot pixel must not count as a foot
+    masks, _ = segment_feet(img, n_feet=2)
+    assert len(masks) == 2
+    assert np.nonzero(masks[0])[1].mean() < np.nonzero(masks[1])[1].mean()
+    assert masks[0].sum() > masks[1].sum()  # wider left foot
+
+
+def test_segment_holes_filled_and_nan_excluded():
+    img, truth = synthetic_foot()
+    img[140:160, 90:110] = 22.0  # cold spot inside the foot (e.g. a lesion/cold area)
+    img[0:10, :] = np.nan  # decoded-invalid band (legend/background)
+    masks, _ = segment_feet(img)
+    assert masks[0][150, 100] and not masks[0][0:10].any()
+
+
+def test_segment_no_foot_returns_empty():
+    img = np.full((50, 50), 25.0)
+    img[0, 0] = 26.0  # single pixel is below min_area_fraction
+    masks, _ = segment_feet(img, threshold=25.5)
+    assert masks == []
+    assert segment_feet(np.full((20, 20), 25.0), threshold=30.0)[0] == []
+
+
+@pytest.mark.parametrize("heel,hind_row_range", [("bottom", (200, 270)), ("top", (30, 100))])
+def test_split_regions_partition_and_heel_orientation(heel, hind_row_range):
+    img, truth = synthetic_foot()
+    regions = split_foot_regions(truth, heel)
+    assert tuple(regions) == FOOT_REGION_NAMES
+    stacked = np.stack(list(regions.values()))
+    assert (stacked.sum(axis=0) <= 1).all()  # disjoint
+    assert np.array_equal(stacked.any(axis=0), truth)  # exact union
+    rows = np.nonzero(regions["Hindfoot"])[0]
+    assert hind_row_range[0] < rows.mean() < hind_row_range[1]
+    # equal thirds of the long axis (foot spans ~240 rows) -> ~80 rows each
+    for name in FOOT_REGION_NAMES:
+        r = np.nonzero(regions[name])[0]
+        assert r.max() - r.min() == pytest.approx(80, abs=4)
+
+
+def test_split_regions_horizontal_foot_and_custom_fractions():
+    img, truth = synthetic_foot(h=200, w=300, cx=150, cy=100, ry=45, rx=120)  # long axis horizontal
+    heel_right = split_foot_regions(truth, "right", fractions=(0.4, 0.7))
+    cols = {n: np.nonzero(m)[1].mean() for n, m in heel_right.items()}
+    assert cols["Hindfoot"] > cols["Midfoot"] > cols["Forefoot"]
+    length = 240.0
+    assert heel_right["Hindfoot"].any(axis=0).sum() == pytest.approx(0.4 * length, abs=4)
+
+
+def test_split_regions_tilted_foot_follows_long_axis():
+    img, truth = synthetic_foot(angle=25)
+    regions = split_foot_regions(truth, "bottom")
+    assert np.array_equal(np.stack(list(regions.values())).any(axis=0), truth)
+    areas = [m.sum() for m in regions.values()]
+    # thirds of an ellipse's length: end caps are smaller than the middle section
+    assert areas[1] > areas[0] and areas[1] > areas[2]
+
+
+def test_split_regions_validation():
+    _, truth = synthetic_foot()
+    with pytest.raises(ValueError):
+        split_foot_regions(truth, "sideways")
+    for bad in [(0.7, 0.3), (0.0, 0.5), (0.3, 1.0)]:
+        with pytest.raises(ValueError):
+            split_foot_regions(truth, "bottom", bad)
+    with pytest.raises(ValueError):
+        split_foot_regions(np.zeros((10, 10), dtype=bool), "bottom")
+
+
+def test_regions_round_trip_through_editable_canvas_polygons():
+    """Auto regions -> Fabric polygons on a downscaled canvas -> masks must match."""
+    img, truth = synthetic_foot(h=600, w=400, cx=200, cy=300, ry=240, rx=90, angle=12)
+    regions = list(split_foot_regions(truth, "bottom").values())
+    drawing = masks_to_fabric_drawing(regions, canvas_width=400, canvas_height=600,
+                                      original_width=400, original_height=600)
+    assert len(drawing["objects"]) == 3
+    back = masks_from_canvas(drawing, canvas_width=400, canvas_height=600,
+                             original_width=400, original_height=600)
+    assert len(back) == 3
+    for original, recovered in zip(regions, back):
+        assert (original & recovered).sum() / (original | recovered).sum() > 0.97
+        assert recovered.sum() == pytest.approx(original.sum(), rel=0.03)
+    # also at a different canvas scale (900-wide canvas cap on big images)
+    big = masks_from_canvas(
+        masks_to_fabric_drawing(regions, canvas_width=200, canvas_height=300, original_width=400, original_height=600),
+        canvas_width=200, canvas_height=300, original_width=400, original_height=600)
+    assert big[1].sum() == pytest.approx(regions[1].sum(), rel=0.03)

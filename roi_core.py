@@ -456,3 +456,198 @@ def overlay_masks(
         output[border] = color
     return np.clip(output, 0, 255).astype(np.uint8)
 
+
+
+# ---------------------------------------------------------------------------
+# Automatic foot regions (plantar thermal images) - exploratory
+# ---------------------------------------------------------------------------
+
+FOOT_REGION_NAMES = ("Hindfoot", "Midfoot", "Forefoot")
+HEEL_SIDES = ("bottom", "top", "left", "right")
+_HEEL_DIRECTION = {"bottom": (0.0, 1.0), "top": (0.0, -1.0), "left": (-1.0, 0.0), "right": (1.0, 0.0)}
+
+
+def otsu_threshold(values: np.ndarray, bins: int = 256) -> float:
+    """Otsu's threshold over the finite values (maximises between-class variance)."""
+    data = np.asarray(values, dtype=float)
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        raise ValueError("No finite values to threshold.")
+    low, high = float(data.min()), float(data.max())
+    if high <= low:
+        raise ValueError("Image has a single value; cannot separate foot from background.")
+    hist, edges = np.histogram(data, bins=bins, range=(low, high))
+    weights = hist.astype(float)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    w0 = np.cumsum(weights)
+    w1 = w0[-1] - w0
+    sum0 = np.cumsum(weights * centers)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean0 = sum0 / w0
+        mean1 = (sum0[-1] - sum0) / w1
+        between = w0 * w1 * (mean0 - mean1) ** 2
+    between[~np.isfinite(between)] = -1.0
+    # Take the middle of the plateau of tied maxima (not the first bin), so a
+    # two-level image gets a threshold midway between the levels.
+    best = np.flatnonzero(np.isclose(between, between.max(), rtol=1e-9))
+    return float(centers[int(best[0] + best[-1]) // 2])
+
+
+def segment_feet(
+    values: np.ndarray,
+    *,
+    threshold: float | None = None,
+    n_feet: int = 1,
+    min_area_fraction: float = 0.005,
+) -> tuple[list[np.ndarray], float]:
+    """Segment the warmest connected blob(s): returns (masks left-to-right, threshold).
+
+    Pixels with value > threshold (NaN excluded) are kept, holes filled, and the
+    `n_feet` largest components larger than `min_area_fraction` of the image kept.
+    """
+    from scipy.ndimage import binary_fill_holes, label
+
+    data = np.asarray(values, dtype=float)
+    if data.ndim != 2:
+        raise ValueError("segment_feet expects a 2-D measurement map.")
+    if n_feet < 1:
+        raise ValueError("n_feet must be at least 1.")
+    cut = otsu_threshold(data) if threshold is None else float(threshold)
+    candidate = np.isfinite(data) & (data > cut)
+    labels, count = label(candidate)
+    if count == 0:
+        return [], cut
+    sizes = np.bincount(labels.ravel())[1:]
+    order = [i for i in np.argsort(sizes)[::-1] if sizes[i] >= min_area_fraction * data.size][:n_feet]
+    masks = [binary_fill_holes(labels == (i + 1)) for i in order]
+    masks.sort(key=lambda m: float(np.nonzero(m)[1].mean()))
+    return masks, cut
+
+
+def split_foot_regions(
+    mask: np.ndarray,
+    heel_side: str,
+    fractions: tuple[float, float] = (1 / 3, 2 / 3),
+) -> dict[str, np.ndarray]:
+    """Split one foot mask into hindfoot / midfoot / forefoot along its long axis.
+
+    The long axis is the first principal axis of the mask pixels. Position t runs
+    from 0 at the heel end to 1 at the toe end (heel end = the end towards
+    `heel_side`), and the regions are t < f1, f1 <= t < f2, t >= f2 of the
+    projected foot length. The three regions are disjoint and their union is
+    exactly the input mask.
+    """
+    if heel_side not in _HEEL_DIRECTION:
+        raise ValueError(f"heel_side must be one of {HEEL_SIDES}")
+    f1, f2 = fractions
+    if not (0.0 < f1 < f2 < 1.0):
+        raise ValueError("fractions must satisfy 0 < hindfoot/midfoot < midfoot/forefoot < 1.")
+    roi = np.asarray(mask, dtype=bool)
+    ys, xs = np.nonzero(roi)
+    if xs.size < 3:
+        raise ValueError("Foot mask is too small to split.")
+    coords = np.column_stack([xs + 0.5, ys + 0.5])
+    centered = coords - coords.mean(axis=0)
+    eigenvalues, eigenvectors = np.linalg.eigh(np.cov(centered.T))
+    axis = eigenvectors[:, int(np.argmax(eigenvalues))]
+    if float(np.dot(axis, _HEEL_DIRECTION[heel_side])) < 0:
+        axis = -axis  # axis now points towards the heel
+    projection = centered @ axis
+    span = float(projection.max() - projection.min())
+    if span <= 0:
+        raise ValueError("Foot mask has no length along its long axis.")
+    t = (projection.max() - projection) / span  # 0 at heel, 1 at toes
+    bins = np.digitize(t, [f1, f2])  # 0,1,2
+    regions = {}
+    for index, name in enumerate(FOOT_REGION_NAMES):
+        region = np.zeros(roi.shape, dtype=bool)
+        region[ys[bins == index], xs[bins == index]] = True
+        regions[name] = region
+    return regions
+
+
+def _simplify_polyline(points: np.ndarray, tolerance: float) -> np.ndarray:
+    """Ramer-Douglas-Peucker simplification of a closed ring (iterative)."""
+    if len(points) < 4:
+        return points
+    keep = np.zeros(len(points), dtype=bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(points) - 1)]
+    while stack:
+        start, end = stack.pop()
+        if end <= start + 1:
+            continue
+        a, b = points[start], points[end]
+        segment = b - a
+        norm = float(np.hypot(*segment))
+        inner = points[start + 1 : end] - a
+        if norm == 0:
+            distances = np.hypot(inner[:, 0], inner[:, 1])
+        else:
+            distances = np.abs(segment[0] * inner[:, 1] - segment[1] * inner[:, 0]) / norm
+        far = int(np.argmax(distances))
+        if distances[far] > tolerance:
+            split = start + 1 + far
+            keep[split] = True
+            stack.extend([(start, split), (split, end)])
+    return points[keep]
+
+
+def mask_to_polygon(mask: np.ndarray, tolerance: float = 0.6) -> list[tuple[float, float]]:
+    """Outer boundary of the largest component as polygon vertices in pixel-edge
+    coordinates (pixel (i, j) covers [j, j+1) x [i, i+1)); holes are ignored."""
+    import contourpy
+
+    roi = np.pad(np.asarray(mask, dtype=float), 1)
+    lines = contourpy.contour_generator(z=roi).lines(0.5)
+    if not lines:
+        return []
+    ring = max(lines, key=len)
+    ring = np.asarray(ring, dtype=float) - 0.5  # padded index -> source pixel-edge coordinates
+    if np.allclose(ring[0], ring[-1]):
+        ring = ring[:-1]
+    ring = _simplify_polyline(np.vstack([ring, ring[:1]]), tolerance)[:-1]
+    return [(float(x), float(y)) for x, y in ring]
+
+
+def masks_to_fabric_drawing(
+    masks: list[np.ndarray],
+    *,
+    canvas_width: int,
+    canvas_height: int,
+    original_width: int,
+    original_height: int,
+    colors: tuple[str, ...] = ("#00FFFF", "#FFD200", "#FF5050"),
+) -> dict[str, Any]:
+    """Build a Fabric.js drawing (editable polygons in canvas pixels) from masks."""
+    x_scale = canvas_width / float(original_width)
+    y_scale = canvas_height / float(original_height)
+    objects = []
+    for index, mask in enumerate(masks):
+        polygon = mask_to_polygon(mask)
+        if len(polygon) < 3:
+            continue
+        pts = np.asarray([(x * x_scale, y * y_scale) for x, y in polygon])
+        low = pts.min(axis=0)
+        high = pts.max(axis=0)
+        color = colors[index % len(colors)]
+        objects.append(
+            {
+                "type": "polygon",
+                "version": "4.4.0",
+                "originX": "left",
+                "originY": "top",
+                "left": float(low[0]),
+                "top": float(low[1]),
+                "width": float(high[0] - low[0]),
+                "height": float(high[1] - low[1]),
+                "fill": "rgba(255, 30, 30, 0.22)",
+                "stroke": color,
+                "strokeWidth": 3,
+                "scaleX": 1,
+                "scaleY": 1,
+                "angle": 0,
+                "points": [{"x": float(x - low[0]), "y": float(y - low[1])} for x, y in pts],
+            }
+        )
+    return {"version": "4.4.0", "objects": objects}

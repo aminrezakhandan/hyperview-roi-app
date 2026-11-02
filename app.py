@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -37,14 +38,19 @@ def _background_image_to_data_url(image, *_args, **_kwargs) -> str:
 _drawable_canvas_module.image_to_url = _background_image_to_data_url
 
 from roi_core import (
+    FOOT_REGION_NAMES,
+    HEEL_SIDES,
     SUPPORTED_COLORMAPS,
     decode_false_color,
     ensure_rgb_uint8,
     flatten_alpha,
     masks_from_canvas,
+    masks_to_fabric_drawing,
     normalize_to_rgb,
     overlay_masks,
     roi_geometry,
+    segment_feet,
+    split_foot_regions,
     summary_statistics,
 )
 
@@ -465,7 +471,77 @@ with control_right:
         st.session_state.canvas_revision = 0
     if st.button("Clear all contours", use_container_width=True):
         st.session_state.canvas_revision += 1
+        st.session_state.pop("auto_foot", None)
         st.rerun()
+
+with st.expander("Automatic foot regions: hindfoot / midfoot / forefoot (plantar thermal, exploratory)"):
+    st.caption(
+        "Segments the warmest connected area as the foot (Otsu or manual threshold), finds its long "
+        "axis, and splits the length from the heel into regions. The result is loaded onto the canvas "
+        "as ordinary editable polygons: always check and correct them. Plantar views, roughly "
+        "upright, with the foot warmer than the background. Crop out legends, hands and bedding first."
+    )
+    auto_left, auto_right = st.columns(2)
+    with auto_left:
+        auto_feet = st.radio("Feet in image", (1, 2), horizontal=True)
+        auto_heel = st.selectbox("Heel is at the ... of the image", HEEL_SIDES, index=0)
+        threshold_mode = st.radio("Foot threshold", ("Automatic (Otsu)", "Manual"), horizontal=True)
+        manual_threshold = None
+        if threshold_mode == "Manual":
+            manual_threshold = st.number_input(
+                "Threshold (foot > this value)", value=float(np.nanmedian(finite)) if finite.size else 0.0, format="%.4f"
+            )
+    with auto_right:
+        hind_end = st.number_input("Hindfoot ends at (% of foot length from heel)", 5.0, 90.0, 33.0, step=1.0)
+        mid_end = st.number_input("Midfoot ends at (% of foot length from heel)", 10.0, 95.0, 66.0, step=1.0)
+    if st.button("Generate foot regions"):
+        try:
+            if not hind_end < mid_end:
+                raise ValueError("Hindfoot boundary must be smaller than the midfoot boundary.")
+            foot_masks, used_threshold = segment_feet(
+                values, threshold=manual_threshold, n_feet=int(auto_feet)
+            )
+            if not foot_masks:
+                raise ValueError("No foot-sized warm region found. Adjust the threshold or crop the image.")
+            region_masks, labels = [], []
+            for foot_number, foot_mask in enumerate(foot_masks, start=1):
+                parts = split_foot_regions(foot_mask, auto_heel, (hind_end / 100.0, mid_end / 100.0))
+                for name in FOOT_REGION_NAMES:
+                    region_masks.append(parts[name])
+                    labels.append(f"Foot {foot_number} {name.lower()}")
+            drawing_width = min(900, width)
+            drawing_height = max(1, int(round(height * drawing_width / width)))
+            st.session_state.auto_foot = {
+                "file_hash": file_hash,
+                "drawing": masks_to_fabric_drawing(
+                    region_masks,
+                    canvas_width=drawing_width,
+                    canvas_height=drawing_height,
+                    original_width=width,
+                    original_height=height,
+                ),
+                "labels": labels,
+                "threshold": used_threshold,
+                "feet_found": len(foot_masks),
+                "feet_requested": int(auto_feet),
+            }
+            st.session_state.canvas_revision += 1
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+auto_foot = st.session_state.get("auto_foot")
+if auto_foot is not None and auto_foot["file_hash"] != file_hash:
+    auto_foot = None
+if auto_foot is not None:
+    st.info(
+        f"Auto foot regions loaded (threshold {auto_foot['threshold']:.4g}; "
+        f"{auto_foot['feet_found']} of {auto_foot['feet_requested']} requested feet found). "
+        "ROI order: " + "; ".join(f"ROI {i} = {lab}" for i, lab in enumerate(auto_foot["labels"], start=1))
+        + ". Labels apply only until you add, delete or reorder contours."
+    )
+    if auto_foot["feet_found"] < auto_foot["feet_requested"]:
+        st.warning("Fewer feet than requested were segmented (feet may touch or be too cool); check the outlines.")
 
 drawing_modes = {
     "Polygon": "polygon",
@@ -489,6 +565,7 @@ canvas_result = st_canvas(
     height=canvas_height,
     width=canvas_width,
     drawing_mode=drawing_modes[drawing_mode_label],
+    initial_drawing=copy.deepcopy(auto_foot["drawing"]) if auto_foot is not None else None,
     display_toolbar=True,
     key=f"roi_canvas_{file_hash}_{st.session_state.canvas_revision}",
 )
