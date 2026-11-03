@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
-import html
 import io
 import json
 import re
@@ -56,18 +55,13 @@ def show_image(array, caption: str = "", width: int | None = None, max_display_w
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    size = f"width:{int(width)}px;max-width:100%;" if width else "width:100%;"
-    caption_html = (
-        f'<figcaption style="font-size:0.85rem;opacity:0.7;margin-top:0.3rem">{html.escape(caption)}</figcaption>'
-        if caption
-        else ""
-    )
-    st.markdown(
-        f'<figure style="margin:0 0 1rem 0"><img alt="{html.escape(caption[:80])}" '
-        f'src="data:image/png;base64,{encoded}" style="{size}height:auto;image-rendering:auto"/>'
-        f"{caption_html}</figure>",
-        unsafe_allow_html=True,
-    )
+    # A data: URL string is passed through by st.image as-is (no /media/ file), so Streamlit's
+    # normal sizing and captions apply.
+    data_url = f"data:image/png;base64,{encoded}"
+    if width:
+        st.image(data_url, caption=caption or None, width=int(width))
+    else:
+        st.image(data_url, caption=caption or None, use_container_width=True)
 
 from roi_core import (
     FOOT_REGION_NAMES,
@@ -126,6 +120,7 @@ MAX_IMAGE_PIXELS = 40_000_000  # keeps memory bounded on small hosts (e.g. Commu
 
 def read_raster(payload: bytes) -> tuple[np.ndarray, np.ndarray, dict]:
     image = Image.open(io.BytesIO(payload))
+    source_format = image.format  # exif_transpose returns a copy whose .format is None
     if image.width * image.height > MAX_IMAGE_PIXELS:
         raise ValueError(
             f"Image is too large ({image.width} x {image.height}); "
@@ -133,7 +128,7 @@ def read_raster(payload: bytes) -> tuple[np.ndarray, np.ndarray, dict]:
         )
     image = ImageOps.exif_transpose(image)
     metadata = {
-        "format": image.format,
+        "format": source_format,
         "width": image.width,
         "height": image.height,
         "mode": image.mode,
@@ -255,6 +250,19 @@ def read_dicom(payload: bytes) -> tuple[np.ndarray, np.ndarray, dict, float | No
         "study_description": str(getattr(dataset, "StudyDescription", "")),
     }
     return scalar, display, metadata, row_spacing, column_spacing
+
+
+def read_compare(file) -> tuple[np.ndarray, str]:
+    """Read the optional comparison file as a display RGB image (view only)."""
+    payload = file.getvalue()
+    if Path(file.name).suffix.lower() == ".csv":
+        frame = pd.read_csv(io.BytesIO(payload), header=None)
+        array = trim_nan_border(frame.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float))
+        if not np.isfinite(array).any():
+            raise ValueError("No numeric pixel values were found in the comparison CSV.")
+        return normalize_to_rgb(array, cmap_name="viridis"), f"CSV matrix {array.shape[1]} x {array.shape[0]}"
+    _, display, meta = read_raster(payload)
+    return display, f"{meta['width']} x {meta['height']} {meta['format']}"
 
 
 def looks_like_dicom(payload: bytes, filename: str) -> bool:
@@ -486,6 +494,14 @@ column_spacing = st.sidebar.number_input(
     format="%.6f",
 )
 
+st.sidebar.header("Compare")
+compare_file = st.sidebar.file_uploader(
+    "Second image to view side by side (optional)",
+    type=["png", "jpg", "jpeg", "tif", "tiff", "bmp", "csv"],
+    key="compare_upload",
+    help="View only: no contours or statistics are computed for this file. CSVs must be a numeric matrix.",
+)
+
 height, width = values.shape
 st.write(
     f"**Source:** {uploaded.name} · **Type:** {source_kind} · "
@@ -494,6 +510,23 @@ st.write(
 
 with st.expander("Source details"):
     st.json(source_metadata)
+
+if compare_file is not None:
+    st.subheader("Side-by-side comparison")
+    try:
+        compare_display, compare_info = read_compare(compare_file)
+    except Exception as exc:
+        st.error(f"Could not read the comparison file: {exc}")
+    else:
+        left_view, right_view = st.columns(2)
+        with left_view:
+            show_image(source_display, caption=f"{uploaded.name} ({width} x {height})")
+        with right_view:
+            show_image(compare_display, caption=f"{compare_file.name} ({compare_info})")
+        st.caption(
+            "View only. For CSV maps the colours are scaled separately for each image, so the same colour "
+            "does not mean the same value across the two panels."
+        )
 
 st.subheader("Draw contour(s)")
 st.caption(
@@ -807,27 +840,9 @@ if combined_mask is not None:
 else:
     metric_columns[2].metric("Contour mean", "Draw a contour")
 
-preferred_columns = [
-    "region",
-    "mean",
-    "median",
-    "std",
-    "min",
-    "p05",
-    "p25",
-    "p75",
-    "p95",
-    "max",
-    "valid_pixels",
-    "missing_pixels",
-    "valid_fraction",
-    "roi_pixels",
-    "roi_fraction",
-    "area",
-    "perimeter",
-    "equivalent_diameter",
-]
-st.dataframe(results[preferred_columns], use_container_width=True, hide_index=True)
+# On-screen table is deliberately compact; the exported statistics CSV/ZIP keep every column.
+displayed_columns = ["region", "mean", "median", "p95", "min", "max"]
+st.dataframe(results[displayed_columns], use_container_width=True, hide_index=True)
 
 if masks:
     st.subheader("Contour quality check")

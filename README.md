@@ -41,6 +41,19 @@ streamlit run app.py
 The browser should open automatically. If it does not, open the local address
 shown in the terminal, usually `http://localhost:8501`.
 
+## Viewing two images side by side
+
+Use **Compare** in the sidebar to add a second image or CSV matrix. It is shown
+next to the main file under *Side-by-side comparison*. This is view only (no
+contours or statistics are computed for the second file), and CSV maps are
+colour-scaled separately, so identical colours do not mean identical values.
+
+## Results table and exports
+
+The on-screen results table shows `region, mean, median, p95, min, max`. The
+downloaded statistics CSV and ZIP keep every detail (all percentiles, std, pixel
+counts, area, perimeter, bounding box, metadata, masks, overlay).
+
 ## Recommended workflow
 
 1. Upload one image, DICOM file, or CSV pixel map.
