@@ -54,6 +54,31 @@ The on-screen results table shows `region, mean, median, p95, min, max`. The
 downloaded statistics CSV and ZIP keep every detail (all percentiles, std, pixel
 counts, area, perimeter, bounding box, metadata, masks, overlay).
 
+## Left-right comparison
+
+With two or more contours, the **Left-right comparison** section pairs ROIs (A
+and B) and reports, per pair, the mean, median and p95 of each ROI, the
+differences **A minus B**, the ROI areas, and the symmetric area difference
+(`(A - B) / mean(A, B) x 100`). For foot regions made by the app the pairs are
+filled in automatically (same region on the first two feet); after you add,
+delete or reorder contours, check the ROI numbers. Foot 1 is the foot on the left
+of the image, so decide yourself which side that is. Differences use valid
+(decoded) pixels only and are NA if a ROI has none. The comparison is included in
+the export ZIP as `left_right_comparison.csv` and in the metadata.
+
+The optional flag (|mean difference| at least a value you enter, off by default)
+is a screening aid, not a diagnosis. A left-to-right difference of 2.2 C (4 F) is
+the value commonly used in diabetic-foot thermometry, e.g. as the optimal
+contralateral-spot cut-off in one infrared-camera study ([van Netten 2014](https://consensus.app/papers/details/d5b3bc77c802582797b85196c1eb1768/)),
+but other work reports that it is not valid as a single measurement without
+individual correction and next-day confirmation
+([Wijlens 2017](https://consensus.app/papers/details/6e34e38718ed5d20add7b1a346754544/);
+[Featherston 2021](https://consensus.app/papers/details/fd20c59f9a9255838526f39c3621296d/)) and that
+abnormal region differences vary between visits in feet that stay intact
+([Liew 2024](https://consensus.app/papers/details/fb918ff317425bfbbc40492203f15b6f/)).
+Region definitions, camera and protocol differ from those studies, so choose and
+justify your own threshold.
+
 ## Recommended workflow
 
 1. Upload one image, DICOM file, or CSV pixel map.

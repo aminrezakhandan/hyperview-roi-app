@@ -978,3 +978,87 @@ def fit_feet(values: np.ndarray, heel_side: str, seed_masks: list[np.ndarray]) -
         chosen = [fits[0]["per_mirror"][m0], fits[1]["per_mirror"][m1]]
         return [{**chosen[0], "per_mirror": fits[0]["per_mirror"]}, {**chosen[1], "per_mirror": fits[1]["per_mirror"]}]
     return fits
+
+
+# ---------------------------------------------------------------------------
+# Left-right (contralateral) comparison
+# ---------------------------------------------------------------------------
+
+_REGION_ORDER = tuple(name.lower() for name in FOOT_REGION_NAMES)
+
+
+def default_region_pairs(labels: list[str] | None, n_masks: int) -> list[tuple[str, int, int]]:
+    """Default (label, ROI_A, ROI_B) pairs, 1-based ROI numbers.
+
+    If `labels` (e.g. "Foot 1 hindfoot", "Foot 2 hindfoot", ...) describe exactly
+    the current `n_masks` contours, pair the same region across the first two
+    feet/contours; otherwise fall back to a single pair of ROI 1 versus ROI 2.
+    """
+    import re
+
+    if n_masks < 2:
+        return []
+    if labels and len(labels) == n_masks:
+        by_region: dict[str, dict[int, int]] = {}
+        for roi_number, label in enumerate(labels, start=1):
+            match = re.match(r"^(?:Foot|Contour) (\d+) (.+)$", label)
+            if match:
+                by_region.setdefault(match.group(2).lower(), {})[int(match.group(1))] = roi_number
+        pairs = []
+        for region in _REGION_ORDER:
+            feet = by_region.get(region, {})
+            if len(feet) >= 2:
+                first, second = sorted(feet)[:2]
+                pairs.append((region.capitalize(), feet[first], feet[second]))
+        if pairs:
+            return pairs
+    return [("Pair 1", 1, 2)]
+
+
+def left_right_comparison(
+    values: np.ndarray,
+    masks: list[np.ndarray],
+    pairs: list[tuple[str, int, int]],
+    *,
+    row_spacing: float = 1.0,
+    column_spacing: float = 1.0,
+    threshold: float | None = None,
+) -> list[dict[str, Any]]:
+    """Per-pair statistics and differences (A - B) between two ROIs.
+
+    pairs: (label, ROI_A, ROI_B) with 1-based ROI numbers. Differences use the
+    valid (finite) pixels of each ROI. `area_difference_percent` is the
+    symmetric percentage (A - B) / mean(A, B) x 100. If `threshold` is given,
+    `exceeds_threshold` is |mean difference| >= threshold (an optional screening
+    aid, not a diagnosis).
+    """
+    rows = []
+    for label, roi_a, roi_b in pairs:
+        for roi_number in (roi_a, roi_b):
+            if not 1 <= int(roi_number) <= len(masks):
+                raise ValueError(f"ROI {roi_number} does not exist (there are {len(masks)} contours).")
+        if int(roi_a) == int(roi_b):
+            raise ValueError(f"'{label}': choose two different ROIs.")
+        stats_a = summary_statistics(values, masks[int(roi_a) - 1])
+        stats_b = summary_statistics(values, masks[int(roi_b) - 1])
+        geometry_a = roi_geometry(masks[int(roi_a) - 1], row_spacing=row_spacing, column_spacing=column_spacing)
+        geometry_b = roi_geometry(masks[int(roi_b) - 1], row_spacing=row_spacing, column_spacing=column_spacing)
+        row: dict[str, Any] = {"region": label, "roi_a": int(roi_a), "roi_b": int(roi_b)}
+        for key in ("mean", "median", "p95"):
+            row[f"{key}_a"] = stats_a[key]
+            row[f"{key}_b"] = stats_b[key]
+            row[f"{key}_difference"] = stats_a[key] - stats_b[key]  # NaN propagates
+        row["valid_pixels_a"] = stats_a["valid_pixels"]
+        row["valid_pixels_b"] = stats_b["valid_pixels"]
+        row["area_a"] = geometry_a["area"]
+        row["area_b"] = geometry_b["area"]
+        mean_area = (geometry_a["area"] + geometry_b["area"]) / 2.0
+        row["area_difference"] = geometry_a["area"] - geometry_b["area"]
+        row["area_difference_percent"] = (
+            100.0 * (geometry_a["area"] - geometry_b["area"]) / mean_area if mean_area else float("nan")
+        )
+        if threshold is not None:
+            diff = row["mean_difference"]
+            row["exceeds_threshold"] = bool(np.isfinite(diff) and abs(diff) >= float(threshold))
+        rows.append(row)
+    return rows
