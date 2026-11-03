@@ -289,16 +289,6 @@ def _origin_fraction(value: Any, axis: str) -> float:
     return {"top": 0.0, "center": 0.5, "bottom": 1.0}.get(text, 0.0)
 
 
-def _bbox_corner(obj: dict[str, Any], width: float, height: float) -> tuple[float, float]:
-    """Fabric.js positions `left`/`top` at the point named by originX/originY
-    (the freehand and polygon tools use "center", not the top-left corner)."""
-    left = float(obj.get("left", 0.0))
-    top = float(obj.get("top", 0.0))
-    corner_x = left - _origin_fraction(obj.get("originX", "left"), "x") * width
-    corner_y = top - _origin_fraction(obj.get("originY", "top"), "y") * height
-    return corner_x, corner_y
-
-
 def _flatten_path(commands: Iterable[Any], steps: int = 12) -> list[tuple[float, float]]:
     """Flatten Fabric.js path commands (M, L, Q, C, Z) into polyline vertices.
 
@@ -329,6 +319,28 @@ def _flatten_path(commands: Iterable[Any], steps: int = 12) -> list[tuple[float,
     return points
 
 
+def _object_center(obj: dict[str, Any], width: float, height: float) -> tuple[float, float]:
+    """Centre of a Fabric.js object in canvas pixels.
+
+    `left`/`top` give the position of the point named by originX/originY *in the
+    rotated object* (the circle tool, for example, sends the drag start point as
+    left/center with the drag direction as `angle`). The centre is therefore that
+    point plus the rotated offset to the box centre; rotating the unrotated box
+    about its own corner-derived centre (the earlier approach) misplaces any
+    rotated object whose origin is not the centre.
+    """
+    left = float(obj.get("left", 0.0))
+    top = float(obj.get("top", 0.0))
+    offset_x = (0.5 - _origin_fraction(obj.get("originX", "left"), "x")) * width
+    offset_y = (0.5 - _origin_fraction(obj.get("originY", "top"), "y")) * height
+    theta = math.radians(float(obj.get("angle", 0.0)))
+    cosine, sine = math.cos(theta), math.sin(theta)
+    return (
+        left + cosine * offset_x - sine * offset_y,
+        top + sine * offset_x + cosine * offset_y,
+    )
+
+
 def _polygon_points_from_object(obj: dict[str, Any]) -> list[tuple[float, float]]:
     obj_type = str(obj.get("type", "")).lower()
     scale_x = float(obj.get("scaleX", 1.0))
@@ -336,7 +348,8 @@ def _polygon_points_from_object(obj: dict[str, Any]) -> list[tuple[float, float]
     angle = float(obj.get("angle", 0.0))
     width = float(obj.get("width", 0.0)) * scale_x
     height = float(obj.get("height", 0.0)) * scale_y
-    corner_x, corner_y = _bbox_corner(obj, width, height)
+    center_x, center_y = _object_center(obj, width, height)
+    corner_x, corner_y = center_x - width / 2.0, center_y - height / 2.0  # unrotated box corner
 
     if obj_type == "polygon":
         raw = [(float(p["x"]), float(p["y"])) for p in obj.get("points", [])]
@@ -362,8 +375,6 @@ def _polygon_points_from_object(obj: dict[str, Any]) -> list[tuple[float, float]
     else:
         return []
 
-    center_x = corner_x + width / 2.0
-    center_y = corner_y + height / 2.0
     return _rotate_points(points, angle, (center_x, center_y))
 
 
@@ -384,8 +395,7 @@ def object_to_polygon(obj: dict[str, Any]) -> list[tuple[float, float]]:
         height = float(obj.get("height", obj.get("radius", 0.0) * 2.0)) * scale_y
         if width <= 0 or height <= 0:
             return []
-        corner_x, corner_y = _bbox_corner(obj, width, height)
-        cx, cy = corner_x + width / 2.0, corner_y + height / 2.0
+        cx, cy = _object_center(obj, width, height)
         theta = np.linspace(0.0, 2.0 * np.pi, 1440, endpoint=False)
         ring = list(zip((cx + width / 2.0 * np.cos(theta)).tolist(), (cy + height / 2.0 * np.sin(theta)).tolist()))
         return _rotate_points(ring, float(obj.get("angle", 0.0)), (cx, cy))
