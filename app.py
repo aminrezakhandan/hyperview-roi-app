@@ -78,6 +78,7 @@ from roi_core import (
     default_morphology_radii,
     ensure_rgb_uint8,
     flatten_alpha,
+    fit_feet,
     masks_from_canvas,
     masks_to_fabric_drawing,
     normalize_to_rgb,
@@ -87,6 +88,8 @@ from roi_core import (
     segment_feet,
     split_foot_regions,
     strict_threshold,
+    template_landmarks,
+    template_regions,
     trim_nan_border,
     summary_statistics,
 )
@@ -514,10 +517,11 @@ with control_right:
 
 with st.expander("Automatic foot regions: hindfoot / midfoot / forefoot (plantar thermal, exploratory)"):
     st.caption(
-        "Two ways: (1) automatic, below, which can fail when warm bedding or cool toes/heels confuse the "
-        "temperature threshold; or (2) most reliable: draw ONE rough outline around each foot and press "
-        "'Split each drawn contour' under the canvas. Automatic mode segments the warmest connected area as the foot (Otsu or manual threshold), finds its long "
-        "axis, and splits the length from the heel into regions. The result is loaded onto the canvas "
+        "Recommended: 'Fit foot template' fits a generic plantar foot outline (heel, arch, ball, toes) to each foot "
+        "by shape and edge alignment, so warm bedding and cool toes matter much less. Alternatively draw ONE rough "
+        "outline per foot and press 'Split each drawn contour' under the canvas, or use the older threshold-based "
+        "generator (which segments the warmest connected area as the foot (Otsu or manual threshold), finds its long "
+        "axis, and splits the length from the heel into regions). The result is loaded onto the canvas "
         "as ordinary editable polygons: always check and correct them. Plantar views, roughly "
         "upright, with the foot warmer than the background. Crop out legends, hands and bedding first."
     )
@@ -572,7 +576,53 @@ with st.expander("Automatic foot regions: hindfoot / midfoot / forefoot (plantar
             )
         except ValueError as exc:
             st.warning(str(exc))
-    if st.button("Generate foot regions"):
+    arch_start, ball_position = template_landmarks()
+    use_landmarks = st.checkbox(
+        f"Shape fit: use the template's landmarks as boundaries (hindfoot ends at {arch_start:.0%} of length "
+        f"= start of the arch, midfoot ends at {ball_position:.0%} = ball of the foot); untick to use the % boxes above",
+        value=True,
+    )
+    if st.button("Fit foot template (shape-based, recommended)", type="primary"):
+        try:
+            with st.spinner("Fitting foot outline(s)..."):
+                base_cut, core_cut = strict_threshold(values)
+                open_r, _ = default_morphology_radii(values.shape)
+                # Thresholds only give a rough starting blob; the outline comes from the shape fit.
+                seed_masks, _ = segment_feet(
+                    values, threshold=base_cut, core_threshold=core_cut, n_feet=int(auto_feet), opening_radius=open_r
+                )
+                if not seed_masks:
+                    raise ValueError("Could not locate a foot to start the fit. Crop the image or draw outlines manually.")
+                fits = fit_feet(values, auto_heel, seed_masks)
+            boundaries = None if use_landmarks else (hind_end / 100.0, mid_end / 100.0)
+            if boundaries is not None and not boundaries[0] < boundaries[1]:
+                raise ValueError("Hindfoot boundary must be smaller than the midfoot boundary.")
+            region_masks, labels = [], []
+            for foot_number, fit in enumerate(fits, start=1):
+                parts = template_regions(fit["params"], auto_heel, values.shape, boundaries)
+                for name in FOOT_REGION_NAMES:
+                    region_masks.append(parts[name])
+                    labels.append(f"Foot {foot_number} {name.lower()}")
+            drawing_width, drawing_height = canvas_size(width, height)
+            st.session_state.auto_foot = {
+                "file_hash": file_hash,
+                "drawing": masks_to_fabric_drawing(
+                    region_masks,
+                    canvas_width=drawing_width,
+                    canvas_height=drawing_height,
+                    original_width=width,
+                    original_height=height,
+                ),
+                "labels": labels,
+                "method": "shape template fit (scores " + ", ".join(f"{f['score']:.2f}" for f in fits) + ")",
+                "feet_found": len(fits),
+                "feet_requested": int(auto_feet),
+            }
+            st.session_state.canvas_revision += 1
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+    if st.button("Generate foot regions (threshold-based, less reliable)"):
         try:
             if not hind_end < mid_end:
                 raise ValueError("Hindfoot boundary must be smaller than the midfoot boundary.")
@@ -609,11 +659,15 @@ auto_foot = st.session_state.get("auto_foot")
 if auto_foot is not None and auto_foot["file_hash"] != file_hash:
     auto_foot = None
 if auto_foot is not None:
+    method = auto_foot.get("method") or (
+        f"threshold {auto_foot['threshold']:.4g}"
+        if np.isfinite(auto_foot.get("threshold", float("nan")))
+        else "split from your drawn outlines"
+    )
     st.info(
-        f"Foot regions loaded ({'threshold ' + format(auto_foot['threshold'], '.4g') + '; ' if np.isfinite(auto_foot['threshold']) else 'split from your drawn outlines; '}"
-        f"{auto_foot['feet_found']} of {auto_foot['feet_requested']} requested feet). "
+        f"Foot regions loaded ({method}; {auto_foot['feet_found']} of {auto_foot['feet_requested']} feet). "
         "ROI order: " + "; ".join(f"ROI {i} = {lab}" for i, lab in enumerate(auto_foot["labels"], start=1))
-        + ". Labels apply only until you add, delete or reorder contours."
+        + ". Labels apply only until you add, delete or reorder contours. Check the outline and correct it with Transform if needed."
     )
     if auto_foot["feet_found"] < auto_foot["feet_requested"]:
         st.warning("Fewer feet than requested were segmented (feet may touch or be too cool); check the outlines.")
