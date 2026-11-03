@@ -561,3 +561,106 @@ def test_otsu_threshold_gives_near_perfect_synthetic_foot_mask():
     img, truth = synthetic_foot()
     masks, _ = segment_feet(img, threshold=otsu_threshold(img))
     assert (masks[0] & truth).sum() / (masks[0] | truth).sum() > 0.99
+
+
+# ---- Shape-based foot template fit (synthetic feet only) -------------------
+
+from roi_core import (  # noqa: E402
+    fit_feet,
+    fit_foot_template,
+    rasterize_polygon,
+    template_landmarks,
+    template_polygon,
+    template_regions,
+)
+
+
+def _synthetic_scene(params_list, shape=(300, 400), bedding=True, seed=0):
+    """Warm template-shaped feet on a cool background with blur, noise and warm bedding."""
+    from scipy.ndimage import gaussian_filter
+
+    h, w = shape
+    truth = [rasterize_polygon(template_polygon(p, "bottom"), h, w) for p in params_list]
+    img = np.full(shape, 22.0)
+    for m in truth:
+        img[m] = 33.0
+    if bedding:
+        yy, xx = np.mgrid[0:h, 0:w]
+        blob = ((xx - 200) ** 2 / 60**2 + (yy - 170) ** 2 / 50**2) <= 1  # 29 C fabric between the feet
+        img[blob & ~np.any(truth, axis=0)] = 29.0
+    img = gaussian_filter(img, 1.5) + np.random.default_rng(seed).normal(0, 0.15, shape)
+    return img, truth
+
+
+def test_template_landmarks_are_inside_the_foot_and_ordered():
+    arch_start, ball = template_landmarks()
+    assert 0.2 < arch_start < 0.4 and 0.6 < ball < 0.85 and arch_start < ball
+
+
+def test_template_polygon_is_foot_shaped():
+    p = {"cx": 100, "cy": 150, "length": 200, "theta": 0, "aspect": 1.0, "mirror": 1}
+    poly = template_polygon(p, "bottom")
+    ys = poly[:, 1]
+    assert ys.max() - ys.min() == pytest.approx(200, abs=1)  # length
+    width_at = lambda y0: np.ptp(poly[np.abs(ys - y0) < 4][:, 0])  # noqa: E731
+    toe_y, heel_y = ys.min(), ys.max()
+    ball_w = width_at(heel_y - 0.72 * 200)
+    arch_w = width_at(heel_y - 0.42 * 200)
+    heel_w = width_at(heel_y - 0.15 * 200)
+    assert ball_w > heel_w > arch_w * 0.95  # ball widest, arch narrowest region
+    assert ball_w == pytest.approx(0.38 * 200, rel=0.1)
+    # mirror flips the shape left-right about the axis
+    flipped = template_polygon({**p, "mirror": -1}, "bottom")
+    assert np.allclose(np.sort(flipped[:, 0] - 100), np.sort(-(poly[:, 0] - 100)), atol=1e-6)
+
+
+def test_template_regions_partition_the_template():
+    p = {"cx": 100, "cy": 150, "length": 200, "theta": 15, "aspect": 1.0, "mirror": 1}
+    regions = template_regions(p, "bottom", (300, 200))
+    stacked = np.stack(list(regions.values()))
+    outline = rasterize_polygon(template_polygon(p, "bottom"), 300, 200)
+    assert (stacked.sum(0) <= 1).all() and np.array_equal(stacked.any(0), outline)
+    assert regions["Hindfoot"].sum() > 0 and regions["Midfoot"].sum() > regions["Hindfoot"].sum() * 0.5
+    arch_start, ball = template_landmarks()
+    custom = template_regions(p, "bottom", (300, 200), boundaries=(0.5, 0.9))
+    assert custom["Hindfoot"].sum() > regions["Hindfoot"].sum()
+
+
+@pytest.mark.parametrize("theta,mirror", [(0, 1), (12, -1), (-15, 1)])
+def test_fit_recovers_single_foot_despite_bedding(theta, mirror):
+    truth_params = {"cx": 120, "cy": 150, "length": 200, "theta": theta, "aspect": 1.0, "arch": 1.0, "mirror": mirror}
+    img, (truth,) = _synthetic_scene([truth_params], shape=(300, 300), bedding=False)
+    yy, xx = np.mgrid[0:300, 0:300]
+    bedding = ((xx - 215) ** 2 / 45**2 + (yy - 170) ** 2 / 45**2) <= 1
+    img = np.where(bedding & ~truth, 29.0, img)
+    # rough seed: the foot with its cooler toe end and heel end cut off + shifted
+    ys, xs = np.nonzero(truth)
+    seed = truth & (yy > np.percentile(ys, 18)) & (yy < np.percentile(ys, 92))
+    fit = fit_foot_template(img, "bottom", seed)
+    mask = rasterize_polygon(fit["polygon"], 300, 300)
+    iou = (mask & truth).sum() / (mask | truth).sum()
+    assert iou > 0.85
+    assert fit["mirror"] == mirror
+
+
+def test_fit_feet_pair_gets_opposite_mirrors_and_both_feet_found():
+    left = {"cx": 110, "cy": 150, "length": 200, "theta": -8, "aspect": 1.0, "arch": 1.0, "mirror": 1}
+    right = {"cx": 290, "cy": 150, "length": 200, "theta": 8, "aspect": 1.0, "arch": 1.0, "mirror": -1}
+    img, truth = _synthetic_scene([left, right], shape=(300, 400))
+    seeds, _ = segment_feet(img, n_feet=2)
+    fits = fit_feet(img, "bottom", seeds)
+    assert [f["mirror"] for f in fits] == [1, -1]
+    for fit, t in zip(fits, truth):
+        mask = rasterize_polygon(fit["polygon"], 300, 400)
+        assert (mask & t).sum() / (mask | t).sum() > 0.85
+
+
+def test_fit_validation_errors():
+    img, (truth,) = _synthetic_scene([{"cx": 100, "cy": 150, "length": 200, "theta": 0, "aspect": 1.0, "mirror": 1}],
+                                     shape=(300, 200), bedding=False)
+    with pytest.raises(ValueError):
+        fit_foot_template(img, "sideways", truth)
+    with pytest.raises(ValueError):
+        fit_foot_template(img, "bottom", np.zeros_like(truth))
+    with pytest.raises(ValueError):
+        fit_foot_template(img, "bottom", truth[:10])

@@ -81,7 +81,25 @@ regions**. The app:
 4. loads them onto the canvas as ordinary polygons, so they can be dragged,
    corrected or deleted, and they flow through the same statistics and export.
 
-**Most reliable: draw, then split.** Automatic segmentation can fail when warm
+**Shape-based fit (recommended): "Fit foot template".** A generic plantar foot
+outline (heel, arch, ball, toes) is fitted to each foot by position, length,
+rotation (+/-45 degrees), width, arch fullness and left/right mirroring. The fit
+maximises how strongly temperature falls off across the outline plus
+inside-versus-surrounding contrast, so it does not depend on a single
+temperature cut-off and warm bedding or cool toes matter much less. (A rough
+threshold blob is used only as the starting guess.) With two feet the pair is
+forced to opposite mirror states. Region boundaries come from the template's
+landmarks: the hindfoot ends at the start of the arch (about 29 % of length from
+the heel) and the midfoot ends at the ball of the foot, its widest point (about
+72 %); untick the option to use your own percentages. The regions load onto the
+canvas as editable polygons. **Limits:** the template is a hand-designed generic
+shape, not anthropometric data, so unusual feet (very flat or high arch,
+deformity, amputation, toes curled or cut off by the image) and oblique views
+will not fit exactly, and cool toe tips are sometimes missed by a few pixels.
+Correct with Transform, or redraw. Validate on your own images (for example Dice
+overlap against manual contours) before relying on it.
+
+**Alternative: draw, then split.** Automatic segmentation can fail when warm
 bedding is as hot as cooler parts of the foot (heels, toes). Instead, draw one
 rough outline around each foot (Polygon tool), choose the heel side and
 boundaries, and press **Split each drawn contour into hindfoot / midfoot /

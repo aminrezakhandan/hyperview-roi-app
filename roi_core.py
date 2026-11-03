@@ -731,3 +731,240 @@ def masks_to_fabric_drawing(
             }
         )
     return {"version": "4.4.0", "objects": objects}
+
+
+# ---------------------------------------------------------------------------
+# Shape-based foot template fit (plantar view) - exploratory
+# ---------------------------------------------------------------------------
+#
+# A generic plantar foot outline is fitted to the image by position, length,
+# rotation, width and mirroring, scoring edge alignment and inside/outside
+# contrast rather than a temperature cut-off. The outline below is an
+# approximate, hand-designed generic shape (NOT anthropometric data): feet with
+# flat/high arches, hallux valgus, amputations etc. will deviate and need manual
+# correction.
+
+# (t, medial half-width, lateral half-width) as fractions of foot length;
+# t = 0 at the heel, 1 at the tip of the longest (big) toe.
+_TEMPLATE_PROFILE = np.array(
+    [
+        (0.000, 0.000, 0.000),
+        (0.015, 0.060, 0.065),
+        (0.050, 0.100, 0.105),
+        (0.120, 0.125, 0.130),
+        (0.220, 0.125, 0.135),
+        (0.320, 0.105, 0.140),
+        (0.420, 0.085, 0.145),
+        (0.520, 0.100, 0.150),
+        (0.620, 0.150, 0.165),
+        (0.720, 0.205, 0.175),
+        (0.800, 0.205, 0.160),
+        (0.880, 0.190, 0.120),
+        (0.950, 0.130, 0.060),
+        (0.985, 0.070, 0.000),
+        (1.000, 0.000, 0.000),
+    ]
+)
+
+
+def _template_samples(n: int = 120, arch: float = 1.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Template half-widths at n positions. `arch` scales the medial edge around
+    the arch (t ~ 0.42): 1 = generic, > 1 = flatter/fuller arch, < 1 = higher arch."""
+    from scipy.interpolate import PchipInterpolator
+
+    t = np.linspace(0.0, 1.0, n)
+    medial = PchipInterpolator(_TEMPLATE_PROFILE[:, 0], _TEMPLATE_PROFILE[:, 1])(t)
+    medial = medial * (1.0 + (float(arch) - 1.0) * np.exp(-(((t - 0.42) / 0.16) ** 2)))
+    lateral = PchipInterpolator(_TEMPLATE_PROFILE[:, 0], _TEMPLATE_PROFILE[:, 2])(t)
+    return t, medial, lateral
+
+
+def template_landmarks() -> tuple[float, float]:
+    """Region boundaries (as fractions of foot length from the heel) derived from
+    the template's shape: the hindfoot ends where the medial edge starts to curve
+    into the arch (medial half-width falls to 90 % of its heel maximum), and the
+    midfoot ends at the ball of the foot (widest point of the forefoot half)."""
+    t, medial, lateral = _template_samples(400)
+    heel = t < 0.3
+    peak_index = int(np.argmax(np.where(heel, medial, -1.0)))
+    after = np.flatnonzero((t > t[peak_index]) & (medial <= 0.9 * medial[peak_index]))
+    arch_start = float(t[after[0]])
+    half = t >= 0.5
+    ball = float(t[half][int(np.argmax((medial + lateral)[half]))])
+    return arch_start, ball
+
+
+def _foot_frame(params: dict[str, Any], heel_side: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (heel_point, toe_direction, medial_direction) in image coordinates."""
+    toe0 = -np.asarray(_HEEL_DIRECTION[heel_side], dtype=float)
+    theta = math.radians(float(params["theta"]))
+    c, s = math.cos(theta), math.sin(theta)
+    toe = np.array([c * toe0[0] - s * toe0[1], s * toe0[0] + c * toe0[1]])
+    side = np.array([-toe[1], toe[0]]) * (1.0 if params.get("mirror", 1) >= 0 else -1.0)
+    centre = np.array([float(params["cx"]), float(params["cy"])])
+    heel_point = centre - 0.5 * float(params["length"]) * toe
+    return heel_point, toe, side
+
+
+def template_polygon(params: dict[str, Any], heel_side: str, n: int = 120) -> np.ndarray:
+    """Fitted template outline as (N, 2) vertices in pixel-edge coordinates."""
+    t, medial, lateral = _template_samples(n, float(params.get("arch", 1.0)))
+    heel_point, toe, side = _foot_frame(params, heel_side)
+    length = float(params["length"])
+    aspect = float(params.get("aspect", 1.0))
+    axis = heel_point[None, :] + length * t[:, None] * toe[None, :]
+    left = axis + (length * aspect * medial)[:, None] * side[None, :]
+    right = axis - (length * aspect * lateral)[:, None] * side[None, :]
+    return np.vstack([left, right[::-1][1:-1]])
+
+
+def template_regions(
+    params: dict[str, Any],
+    heel_side: str,
+    shape: tuple[int, int],
+    boundaries: tuple[float, float] | None = None,
+) -> dict[str, np.ndarray]:
+    """Hindfoot / midfoot / forefoot masks of the fitted template (disjoint; their
+    union is the template outline). Boundaries default to the template landmarks."""
+    h, w = shape
+    f1, f2 = boundaries if boundaries is not None else template_landmarks()
+    outline = rasterize_polygon(template_polygon(params, heel_side), h, w)
+    heel_point, toe, _ = _foot_frame(params, heel_side)
+    ys, xs = np.nonzero(outline)
+    position = ((np.column_stack([xs + 0.5, ys + 0.5]) - heel_point) @ toe) / float(params["length"])
+    bins = np.digitize(position, [f1, f2])
+    regions = {}
+    for index, name in enumerate(FOOT_REGION_NAMES):
+        mask = np.zeros(shape, dtype=bool)
+        mask[ys[bins == index], xs[bins == index]] = True
+        regions[name] = mask
+    return regions
+
+
+def _sampling_geometry(polygon: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Outline points and outward unit normals for a closed polygon."""
+    nxt = np.roll(polygon, -1, axis=0)
+    prev = np.roll(polygon, 1, axis=0)
+    tangent = nxt - prev
+    normal = np.column_stack([tangent[:, 1], -tangent[:, 0]])
+    norm = np.hypot(normal[:, 0], normal[:, 1])
+    norm[norm == 0] = 1.0
+    normal = normal / norm[:, None]
+    signed_area = 0.5 * np.sum(polygon[:, 0] * nxt[:, 1] - nxt[:, 0] * polygon[:, 1])
+    if signed_area < 0:
+        normal = -normal
+    return polygon, normal
+
+
+def fit_foot_template(
+    values: np.ndarray,
+    heel_side: str,
+    seed_mask: np.ndarray,
+    *,
+    sigma: float = 1.5,
+) -> dict[str, Any]:
+    """Fit the generic foot outline to one foot; returns params, score, polygon.
+
+    `seed_mask` only provides the starting position/size (a rough blob); the fit
+    then maximises (a) how strongly the temperature falls off across the outline
+    (edge alignment) and (b) inside-minus-surrounding contrast, over centre,
+    length, rotation (+/-45 degrees), width (0.8-1.3x), arch fullness (0.8-2.2x) and
+    left/right mirroring.
+    """
+    from scipy.ndimage import gaussian_filter, map_coordinates
+    from scipy.optimize import minimize
+
+    if heel_side not in _HEEL_DIRECTION:
+        raise ValueError(f"heel_side must be one of {HEEL_SIDES}")
+    data = np.asarray(values, dtype=float)
+    seed = np.asarray(seed_mask, dtype=bool)
+    if data.ndim != 2 or seed.shape != data.shape or seed.sum() < 20:
+        raise ValueError("Need a 2-D map and a seed blob of at least 20 pixels.")
+    finite = np.isfinite(data)
+    low, high = np.percentile(data[finite], [1, 99])
+    scale = max(high - low, 1e-9)
+    norm = np.clip((np.where(finite, data, low) - low) / scale, 0.0, 1.0)
+    smooth = gaussian_filter(norm, sigma)
+    gy, gx = np.gradient(smooth)
+    gscale = max(float(np.percentile(np.hypot(gx, gy), 95)), 1e-9)
+
+    def sample(field: np.ndarray, points: np.ndarray) -> np.ndarray:
+        # pixel-edge coordinates -> index coordinates (centre of pixel i is i + 0.5)
+        return map_coordinates(field, [points[:, 1] - 0.5, points[:, 0] - 0.5], order=1, mode="nearest")
+
+    def score(vector: np.ndarray, mirror: int) -> float:
+        params = {"cx": vector[0], "cy": vector[1], "length": vector[2], "theta": vector[3],
+                  "aspect": vector[4], "arch": vector[5], "mirror": mirror}
+        polygon = template_polygon(params, heel_side, n=80)
+        points, normals = _sampling_geometry(polygon)
+        directional = -(sample(gx, points) * normals[:, 0] + sample(gy, points) * normals[:, 1])
+        edge = float(np.mean(np.clip(directional / gscale, -1.0, 1.0)))
+        ring = points + normals * (0.05 * vector[2])
+        centre = polygon.mean(axis=0)
+        inner = centre[None, :] + 0.55 * (points - centre[None, :])
+        contrast = float(np.mean(sample(smooth, inner)) - np.mean(sample(smooth, ring)))
+        return (edge + 0.5 * contrast - 0.3 * abs(math.log(max(vector[4], 1e-3)))
+                - 0.15 * abs(math.log(max(vector[5], 1e-3))))
+
+    ys, xs = np.nonzero(seed)
+    centre0 = np.array([xs.mean() + 0.5, ys.mean() + 0.5])
+    toe0 = -np.asarray(_HEEL_DIRECTION[heel_side], dtype=float)
+    extent = (np.column_stack([xs + 0.5, ys + 0.5]) - centre0) @ toe0
+    length0 = float(max(extent.max() - extent.min(), 10.0))
+    side0 = np.array([-toe0[1], toe0[0]])
+
+    bounds = [
+        (centre0[0] - 0.5 * length0, centre0[0] + 0.5 * length0),
+        (centre0[1] - 0.5 * length0, centre0[1] + 0.5 * length0),
+        (0.5 * length0, 1.6 * length0),
+        (-45.0, 45.0),
+        (0.8, 1.3),
+        (0.8, 2.2),
+    ]
+    # Coarse grid over mirror/rotation/shift/length; refine only the best starts.
+    # (The seed blob usually lacks cool toes/heel, so lengths above the seed's are tried.)
+    candidates = []
+    for mirror in (1, -1):
+        for theta0 in (-24.0, -8.0, 8.0, 24.0):
+            for shift in (-0.12, 0.0, 0.12):
+                for stretch in (1.0, 1.12, 1.25):
+                    start = np.concatenate(
+                        [centre0 + shift * length0 * side0 + 0.0 * toe0, [length0 * stretch, theta0, 1.0, 1.0]]
+                    )
+                    start[:2] = start[:2] + (stretch - 1.0) * 0.5 * length0 * toe0  # keep the heel end fixed
+                    start = np.clip(start, [b[0] for b in bounds], [b[1] for b in bounds])
+                    candidates.append((score(start, mirror), mirror, start))
+    candidates.sort(key=lambda item: -item[0])
+    best: dict[str, Any] | None = None
+    shortlist = [c for c in candidates if c[1] == 1][:4] + [c for c in candidates if c[1] == -1][:4]
+    by_mirror: dict[int, dict[str, Any]] = {}
+    for _, mirror, start in shortlist:
+        result = minimize(lambda v: -score(v, mirror), start, method="Powell", bounds=bounds,
+                          options={"xtol": 1e-2, "ftol": 1e-4, "maxiter": 40})
+        if mirror not in by_mirror or -result.fun > by_mirror[mirror]["score"]:
+            by_mirror[mirror] = {
+                "score": float(-result.fun),
+                "mirror": mirror,
+                "params": {"cx": float(result.x[0]), "cy": float(result.x[1]), "length": float(result.x[2]),
+                           "theta": float(result.x[3]), "aspect": float(result.x[4]), "arch": float(result.x[5]),
+                           "mirror": mirror},
+            }
+    for fit in by_mirror.values():
+        fit["polygon"] = template_polygon(fit["params"], heel_side)
+    best = dict(max(by_mirror.values(), key=lambda f: f["score"]))
+    best["per_mirror"] = by_mirror
+    return best
+
+
+def fit_feet(values: np.ndarray, heel_side: str, seed_masks: list[np.ndarray]) -> list[dict[str, Any]]:
+    """Fit one template per seed. With exactly two feet in a plantar view the two
+    are a left/right pair, so their mirror states are forced to be opposite and the
+    assignment with the higher total score is used; otherwise each foot is free."""
+    fits = [fit_foot_template(values, heel_side, seed) for seed in seed_masks]
+    if len(fits) == 2:
+        options = [(1, -1), (-1, 1)]
+        totals = [fits[0]["per_mirror"][m0]["score"] + fits[1]["per_mirror"][m1]["score"] for m0, m1 in options]
+        m0, m1 = options[int(np.argmax(totals))]
+        chosen = [fits[0]["per_mirror"][m0], fits[1]["per_mirror"][m1]]
+        return [{**chosen[0], "per_mirror": fits[0]["per_mirror"]}, {**chosen[1], "per_mirror": fits[1]["per_mirror"]}]
+    return fits
