@@ -70,9 +70,11 @@ from roi_core import (
     canvas_size,
     decode_false_color,
     default_morphology_radii,
+    default_region_pairs,
     ensure_rgb_uint8,
     flatten_alpha,
     fit_feet,
+    left_right_comparison,
     masks_from_canvas,
     masks_to_fabric_drawing,
     normalize_to_rgb,
@@ -844,6 +846,68 @@ else:
 displayed_columns = ["region", "mean", "median", "p95", "min", "max"]
 st.dataframe(results[displayed_columns], use_container_width=True, hide_index=True)
 
+comparison_rows: list[dict] = []
+comparison_threshold = None
+if len(masks) >= 2:
+    st.subheader("Left-right comparison")
+    st.caption(
+        "Pairs two ROIs and reports A minus B for mean, median and p95, plus the areas. For foot regions "
+        "created by the app the pairs are filled in automatically (the same region on the first two feet); "
+        "after you add, delete or reorder contours, check the ROI numbers. Foot 1 is the foot on the left of "
+        "the image: decide yourself which side that is."
+    )
+    auto_labels = (st.session_state.get("auto_foot") or {}).get("labels")
+    if (st.session_state.get("auto_foot") or {}).get("file_hash") != file_hash:
+        auto_labels = None
+    pair_defaults = pd.DataFrame(
+        [{"Region": label, "ROI A": a, "ROI B": b} for label, a, b in default_region_pairs(auto_labels, len(masks))]
+    )
+    pair_table = st.data_editor(
+        pair_defaults,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        key=f"lr_pairs_{file_hash}_{st.session_state.canvas_revision}_{len(masks)}",
+        column_config={
+            "Region": st.column_config.TextColumn("Region / label"),
+            "ROI A": st.column_config.NumberColumn("ROI A", min_value=1, max_value=len(masks), step=1),
+            "ROI B": st.column_config.NumberColumn("ROI B", min_value=1, max_value=len(masks), step=1),
+        },
+    )
+    threshold_text = st.number_input(
+        "Optional: flag pairs where |mean difference| is at least (0 = off)",
+        min_value=0.0,
+        value=0.0,
+        step=0.1,
+        help="A screening aid only. 2.2 C (4 F) is the value commonly used for contralateral plantar "
+        "differences in diabetic feet, but studies question it as a single-measurement warning (see README).",
+    )
+    comparison_threshold = float(threshold_text) if threshold_text > 0 else None
+    valid_pairs = []
+    for _, pair in pair_table.iterrows():
+        if pd.isna(pair["ROI A"]) or pd.isna(pair["ROI B"]):
+            continue
+        valid_pairs.append((str(pair["Region"] or f"ROI {int(pair['ROI A'])} vs {int(pair['ROI B'])}"),
+                            int(pair["ROI A"]), int(pair["ROI B"])))
+    try:
+        comparison_rows = left_right_comparison(
+            values, masks, valid_pairs, row_spacing=row_spacing, column_spacing=column_spacing,
+            threshold=comparison_threshold,
+        )
+    except ValueError as exc:
+        st.warning(str(exc))
+    if comparison_rows:
+        comparison = pd.DataFrame(comparison_rows)
+        shown = comparison[
+            ["region", "roi_a", "roi_b", "mean_a", "mean_b", "mean_difference", "median_difference",
+             "p95_difference", "area_a", "area_b", "area_difference_percent"]
+            + (["exceeds_threshold"] if comparison_threshold is not None else [])
+        ].rename(columns={"roi_a": "ROI A", "roi_b": "ROI B"})
+        st.dataframe(shown, use_container_width=True, hide_index=True)
+        if (comparison["valid_pixels_a"] == 0).any() or (comparison["valid_pixels_b"] == 0).any():
+            st.warning("At least one ROI has no valid (decoded) pixels, so its differences are NA.")
+        st.caption(f"Area unit: {spatial_unit}². Difference = A minus B (area difference is the symmetric percentage).")
+
 if masks:
     st.subheader("Contour quality check")
     overlay = overlay_masks(source_display, masks)
@@ -908,6 +972,11 @@ metadata = {
     "false_color_decoding_is_approximate": approximate_decode,
     "false_color_decoding": decode_details,
     "contour_count": len(masks),
+    "left_right_comparison": {
+        "pairs": [[row["region"], row["roi_a"], row["roi_b"]] for row in comparison_rows],
+        "threshold": comparison_threshold,
+        "convention": "difference = A minus B",
+    },
 }
 
 archive_buffer = io.BytesIO()
@@ -915,6 +984,11 @@ with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as a
     archive.writestr(f"{base}_statistics.csv", statistics_csv)
     archive.writestr(f"{base}_contours.json", json.dumps(contour_json, indent=2))
     archive.writestr(f"{base}_metadata.json", json.dumps(metadata, indent=2))
+    if comparison_rows:
+        archive.writestr(
+            f"{base}_left_right_comparison.csv",
+            pd.DataFrame(comparison_rows).to_csv(index=False).encode("utf-8"),
+        )
     archive.writestr(f"{base}_overlay.png", image_bytes(overlay))
     if combined_mask is not None:
         archive.writestr(f"{base}_combined_mask.png", mask_bytes(combined_mask))

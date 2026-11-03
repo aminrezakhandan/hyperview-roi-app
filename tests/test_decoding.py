@@ -716,3 +716,71 @@ def test_rotated_rect_with_corner_origin_pivots_about_its_origin_point():
     ys, xs = np.nonzero(masks_from_canvas({"objects": [obj]}, canvas_width=300, canvas_height=300,
                                           original_width=300, original_height=300)[0])
     assert (xs.min(), xs.max() + 1, ys.min(), ys.max() + 1) == (60, 100, 100, 200)
+
+
+# ---- Left-right comparison -------------------------------------------------
+
+from roi_core import default_region_pairs, left_right_comparison  # noqa: E402
+
+
+def _two_roi_scene():
+    values = np.full((20, 40), 25.0)
+    values[:, :20] = 33.0  # left half warmer
+    values[:, 20:] = 30.5
+    a = np.zeros((20, 40), dtype=bool); a[2:12, 2:12] = True    # 100 px at 33.0
+    b = np.zeros((20, 40), dtype=bool); b[2:12, 22:37] = True   # 150 px at 30.5
+    return values, [a, b]
+
+
+def test_left_right_differences_are_a_minus_b():
+    values, masks = _two_roi_scene()
+    (row,) = left_right_comparison(values, masks, [("Whole", 1, 2)], row_spacing=2.0, column_spacing=0.5)
+    assert row["mean_a"] == 33.0 and row["mean_b"] == 30.5
+    assert row["mean_difference"] == pytest.approx(2.5) and row["median_difference"] == pytest.approx(2.5)
+    assert row["p95_difference"] == pytest.approx(2.5)
+    assert (row["area_a"], row["area_b"]) == (100.0, 150.0)  # pixels x 2.0 x 0.5
+    assert row["area_difference"] == -50.0
+    assert row["area_difference_percent"] == pytest.approx(100 * -50 / 125)  # symmetric %
+    assert "exceeds_threshold" not in row
+    (swapped,) = left_right_comparison(values, masks, [("Whole", 2, 1)])
+    assert swapped["mean_difference"] == pytest.approx(-2.5)
+
+
+def test_left_right_threshold_flag_is_optional_and_inclusive():
+    values, masks = _two_roi_scene()
+    assert left_right_comparison(values, masks, [("x", 1, 2)], threshold=2.5)[0]["exceeds_threshold"] is True
+    assert left_right_comparison(values, masks, [("x", 1, 2)], threshold=2.6)[0]["exceeds_threshold"] is False
+    assert left_right_comparison(values, masks, [("x", 2, 1)], threshold=2.5)[0]["exceeds_threshold"] is True  # |diff|
+
+
+def test_left_right_handles_nan_and_empty_valid_pixels():
+    values, masks = _two_roi_scene()
+    values = values.copy(); values[masks[1]] = np.nan
+    row = left_right_comparison(values, masks, [("x", 1, 2)], threshold=1.0)[0]
+    assert row["valid_pixels_b"] == 0 and np.isnan(row["mean_b"]) and np.isnan(row["mean_difference"])
+    assert row["exceeds_threshold"] is False
+    assert row["area_b"] == 150.0  # geometry unaffected by missing values
+
+
+def test_left_right_validation():
+    values, masks = _two_roi_scene()
+    with pytest.raises(ValueError):
+        left_right_comparison(values, masks, [("x", 1, 3)])
+    with pytest.raises(ValueError):
+        left_right_comparison(values, masks, [("x", 0, 2)])
+    with pytest.raises(ValueError):
+        left_right_comparison(values, masks, [("x", 2, 2)])
+    assert left_right_comparison(values, masks, []) == []
+
+
+def test_default_pairs_from_foot_labels_and_fallbacks():
+    labels = ["Foot 1 hindfoot", "Foot 1 midfoot", "Foot 1 forefoot",
+              "Foot 2 hindfoot", "Foot 2 midfoot", "Foot 2 forefoot"]
+    assert default_region_pairs(labels, 6) == [("Hindfoot", 1, 4), ("Midfoot", 2, 5), ("Forefoot", 3, 6)]
+    contour_labels = [f"Contour {c} {r}" for c in (1, 2) for r in ("hindfoot", "midfoot", "forefoot")]
+    assert default_region_pairs(contour_labels, 6) == [("Hindfoot", 1, 4), ("Midfoot", 2, 5), ("Forefoot", 3, 6)]
+    assert default_region_pairs(labels, 5) == [("Pair 1", 1, 2)]  # contours changed: labels no longer apply
+    assert default_region_pairs(None, 2) == [("Pair 1", 1, 2)]
+    assert default_region_pairs(None, 1) == [] and default_region_pairs(labels[:3], 1) == []
+    one_foot = labels[:3]
+    assert default_region_pairs(one_foot, 3) == [("Pair 1", 1, 2)]  # only one foot: no automatic pairing
