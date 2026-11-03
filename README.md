@@ -81,6 +81,15 @@ regions**. The app:
 4. loads them onto the canvas as ordinary polygons, so they can be dragged,
    corrected or deleted, and they flow through the same statistics and export.
 
+**Most reliable: draw, then split.** Automatic segmentation can fail when warm
+bedding is as hot as cooler parts of the foot (heels, toes). Instead, draw one
+rough outline around each foot (Polygon tool), choose the heel side and
+boundaries, and press **Split each drawn contour into hindfoot / midfoot /
+forefoot** under the canvas. Each outline is divided along its own long axis, the
+three regions exactly cover your outline, and they stay editable. The result is
+only as accurate as your outline. Tick **Preview the automatic foot mask** to see
+what the automatic modes would select before using them.
+
 **Threshold modes:** *Automatic (Otsu)* keeps everything warmer than the
 background/foot split; *Strict (exclude warm bedding)* seeds from a higher
 two-level Otsu threshold, cuts thin bridges (morphological opening), then grows

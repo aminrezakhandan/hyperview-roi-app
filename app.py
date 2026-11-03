@@ -49,6 +49,7 @@ from roi_core import (
     masks_from_canvas,
     masks_to_fabric_drawing,
     normalize_to_rgb,
+    otsu_threshold,
     overlay_masks,
     roi_geometry,
     segment_feet,
@@ -481,7 +482,9 @@ with control_right:
 
 with st.expander("Automatic foot regions: hindfoot / midfoot / forefoot (plantar thermal, exploratory)"):
     st.caption(
-        "Segments the warmest connected area as the foot (Otsu or manual threshold), finds its long "
+        "Two ways: (1) automatic, below, which can fail when warm bedding or cool toes/heels confuse the "
+        "temperature threshold; or (2) most reliable: draw ONE rough outline around each foot and press "
+        "'Split each drawn contour' under the canvas. Automatic mode segments the warmest connected area as the foot (Otsu or manual threshold), finds its long "
         "axis, and splits the length from the heel into regions. The result is loaded onto the canvas "
         "as ordinary editable polygons: always check and correct them. Plantar views, roughly "
         "upright, with the foot warmer than the background. Crop out legends, hands and bedding first."
@@ -499,31 +502,49 @@ with st.expander("Automatic foot regions: hindfoot / midfoot / forefoot (plantar
         )
         manual_threshold = None
         if threshold_mode == "Manual":
+            try:
+                suggested = otsu_threshold(values)
+            except ValueError:
+                suggested = float(np.nanmedian(finite)) if finite.size else 0.0
             manual_threshold = st.number_input(
-                "Threshold (foot > this value)", value=float(np.nanmedian(finite)) if finite.size else 0.0, format="%.4f"
+                "Threshold (foot > this value)",
+                value=float(suggested),
+                format="%.4f",
+                help="Starts at the automatic Otsu level; raise it until bedding drops out.",
             )
     with auto_right:
         hind_end = st.number_input("Hindfoot ends at (% of foot length from heel)", 5.0, 90.0, 33.0, step=1.0)
         mid_end = st.number_input("Midfoot ends at (% of foot length from heel)", 10.0, 95.0, 66.0, step=1.0)
+    def auto_segment():
+        if threshold_mode.startswith("Strict"):
+            base_cut, core_cut = strict_threshold(values)
+            open_r, grow_r = default_morphology_radii(values.shape)
+            return segment_feet(
+                values,
+                threshold=base_cut,
+                core_threshold=core_cut,
+                n_feet=int(auto_feet),
+                opening_radius=open_r,
+                grow_radius=grow_r,
+            )
+        return segment_feet(values, threshold=manual_threshold, n_feet=int(auto_feet))
+
+    if st.checkbox("Preview the automatic foot mask with these settings"):
+        try:
+            preview_masks, preview_threshold = auto_segment()
+            st.image(
+                overlay_masks(source_display, preview_masks),
+                caption=f"Segmented foot area (threshold {preview_threshold:.4g}). If it includes bedding or "
+                "misses toes, use the drawn-outline method below the canvas instead.",
+                width=480,
+            )
+        except ValueError as exc:
+            st.warning(str(exc))
     if st.button("Generate foot regions"):
         try:
             if not hind_end < mid_end:
                 raise ValueError("Hindfoot boundary must be smaller than the midfoot boundary.")
-            if threshold_mode.startswith("Strict"):
-                base_cut, core_cut = strict_threshold(values)
-                open_r, grow_r = default_morphology_radii(values.shape)
-                foot_masks, used_threshold = segment_feet(
-                    values,
-                    threshold=base_cut,
-                    core_threshold=core_cut,
-                    n_feet=int(auto_feet),
-                    opening_radius=open_r,
-                    grow_radius=grow_r,
-                )
-            else:
-                foot_masks, used_threshold = segment_feet(
-                    values, threshold=manual_threshold, n_feet=int(auto_feet)
-                )
+            foot_masks, used_threshold = auto_segment()
             if not foot_masks:
                 raise ValueError("No foot-sized warm region found. Adjust the threshold or crop the image.")
             region_masks, labels = [], []
@@ -557,8 +578,8 @@ if auto_foot is not None and auto_foot["file_hash"] != file_hash:
     auto_foot = None
 if auto_foot is not None:
     st.info(
-        f"Auto foot regions loaded (threshold {auto_foot['threshold']:.4g}; "
-        f"{auto_foot['feet_found']} of {auto_foot['feet_requested']} requested feet found). "
+        f"Foot regions loaded ({'threshold ' + format(auto_foot['threshold'], '.4g') + '; ' if np.isfinite(auto_foot['threshold']) else 'split from your drawn outlines; '}"
+        f"{auto_foot['feet_found']} of {auto_foot['feet_requested']} requested feet). "
         "ROI order: " + "; ".join(f"ROI {i} = {lab}" for i, lab in enumerate(auto_foot["labels"], start=1))
         + ". Labels apply only until you add, delete or reorder contours."
     )
@@ -598,6 +619,41 @@ masks = masks_from_canvas(
     original_width=width,
     original_height=height,
 )
+
+if masks:
+    split_help = (
+        "Use on whole-foot outlines (one per foot). Each contour is divided along its own long axis "
+        "from the heel into hindfoot / midfoot / forefoot using the heel side and boundaries chosen in "
+        "'Automatic foot regions'. The three regions replace the outline and stay editable."
+    )
+    if st.button("Split each drawn contour into hindfoot / midfoot / forefoot", help=split_help):
+        try:
+            if not hind_end < mid_end:
+                raise ValueError("Hindfoot boundary must be smaller than the midfoot boundary.")
+            region_masks, labels = [], []
+            for contour_number, contour_mask in enumerate(masks, start=1):
+                parts = split_foot_regions(contour_mask, auto_heel, (hind_end / 100.0, mid_end / 100.0))
+                for name in FOOT_REGION_NAMES:
+                    region_masks.append(parts[name])
+                    labels.append(f"Contour {contour_number} {name.lower()}")
+            st.session_state.auto_foot = {
+                "file_hash": file_hash,
+                "drawing": masks_to_fabric_drawing(
+                    region_masks,
+                    canvas_width=canvas_width,
+                    canvas_height=canvas_height,
+                    original_width=width,
+                    original_height=height,
+                ),
+                "labels": labels,
+                "threshold": float("nan"),
+                "feet_found": len(masks),
+                "feet_requested": len(masks),
+            }
+            st.session_state.canvas_revision += 1
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
 
 rows = []
 whole_stats = summary_statistics(values)
