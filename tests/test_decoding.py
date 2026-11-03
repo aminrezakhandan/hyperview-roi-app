@@ -664,3 +664,55 @@ def test_fit_validation_errors():
         fit_foot_template(img, "bottom", np.zeros_like(truth))
     with pytest.raises(ValueError):
         fit_foot_template(img, "bottom", truth[:10])
+
+
+# ---- Fabric.js object placement (regression: circle tool rotates about the drag start) ----
+
+
+def _circle_json(x0, y0, x1, y1):
+    """What the canvas circle tool sends for a drag from (x0, y0) to (x1, y1):
+    diameter = drag length, origin = start point (left/center), angle = drag direction."""
+    import math
+
+    diameter = math.hypot(x1 - x0, y1 - y0)
+    return {"type": "circle", "originX": "left", "originY": "center", "left": x0, "top": y0,
+            "width": diameter, "height": diameter, "radius": diameter / 2,
+            "angle": math.degrees(math.atan2(y1 - y0, x1 - x0)), "scaleX": 1, "scaleY": 1}
+
+
+@pytest.mark.parametrize("drag", [(100, 100, 180, 160), (250, 200, 150, 120), (100, 220, 190, 150),
+                                  (260, 90, 200, 210), (150, 150, 250, 150), (150, 150, 150, 250)])
+def test_circle_tool_centre_is_midpoint_of_drag_in_every_direction(drag):
+    x0, y0, x1, y1 = drag
+    mask = masks_from_canvas({"objects": [_circle_json(*drag)]}, canvas_width=400, canvas_height=300,
+                             original_width=400, original_height=300)[0]
+    ys, xs = np.nonzero(mask)
+    assert xs.mean() + 0.5 == pytest.approx((x0 + x1) / 2, abs=0.6)
+    assert ys.mean() + 0.5 == pytest.approx((y0 + y1) / 2, abs=0.6)
+    radius = np.hypot(x1 - x0, y1 - y0) / 2
+    assert mask.sum() == pytest.approx(np.pi * radius**2, rel=0.01)
+
+
+def test_exact_circle_json_captured_from_the_canvas():
+    obj = {"type": "circle", "originX": "left", "originY": "center", "left": 99, "top": 99, "width": 100,
+           "height": 100, "scaleX": 1, "scaleY": 1, "angle": 36.87, "radius": 50}
+    ys, xs = np.nonzero(masks_from_canvas({"objects": [obj]}, canvas_width=400, canvas_height=300,
+                                          original_width=400, original_height=300)[0])
+    assert (xs.mean() + 0.5, ys.mean() + 0.5) == pytest.approx((139, 129), abs=0.6)  # not (149, 99)
+
+
+def test_circle_position_scales_with_canvas_to_source_ratio():
+    obj = _circle_json(100, 100, 180, 160)
+    mask = masks_from_canvas({"objects": [obj]}, canvas_width=400, canvas_height=300,
+                             original_width=800, original_height=600)[0]
+    ys, xs = np.nonzero(mask)
+    assert (xs.mean() + 0.5, ys.mean() + 0.5) == pytest.approx((280, 260), abs=1.2)
+
+
+def test_rotated_rect_with_corner_origin_pivots_about_its_origin_point():
+    # origin top-left at (100, 100), 100 x 40, rotated 90 degrees clockwise about that corner
+    obj = {"type": "rect", "originX": "left", "originY": "top", "left": 100, "top": 100,
+           "width": 100, "height": 40, "angle": 90, "scaleX": 1, "scaleY": 1}
+    ys, xs = np.nonzero(masks_from_canvas({"objects": [obj]}, canvas_width=300, canvas_height=300,
+                                          original_width=300, original_height=300)[0])
+    assert (xs.min(), xs.max() + 1, ys.min(), ys.max() + 1) == (60, 100, 100, 200)
