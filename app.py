@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import html
 import io
 import json
 import re
@@ -36,6 +37,37 @@ def _background_image_to_data_url(image, *_args, **_kwargs) -> str:
 
 
 _drawable_canvas_module.image_to_url = _background_image_to_data_url
+
+
+def show_image(array, caption: str = "", width: int | None = None, max_display_width: int = 1600) -> None:
+    """Display an image as an inline data URL.
+
+    st.image serves files through Streamlit's media endpoint ("/media/<hash>.png"),
+    which does not resolve behind Community Cloud's proxy path prefix and renders a
+    broken-image icon (the same problem the canvas background works around above).
+    Embedding the PNG avoids the media endpoint; nothing is written to disk.
+    """
+    image = Image.fromarray(ensure_rgb_uint8(array))
+    if image.width > max_display_width:  # display copy only; exports keep full resolution
+        image = image.resize(
+            (max_display_width, max(1, round(image.height * max_display_width / image.width))),
+            Image.Resampling.LANCZOS,
+        )
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    size = f"width:{int(width)}px;max-width:100%;" if width else "width:100%;"
+    caption_html = (
+        f'<figcaption style="font-size:0.85rem;opacity:0.7;margin-top:0.3rem">{html.escape(caption)}</figcaption>'
+        if caption
+        else ""
+    )
+    st.markdown(
+        f'<figure style="margin:0 0 1rem 0"><img alt="{html.escape(caption[:80])}" '
+        f'src="data:image/png;base64,{encoded}" style="{size}height:auto;image-rendering:auto"/>'
+        f"{caption_html}</figure>",
+        unsafe_allow_html=True,
+    )
 
 from roi_core import (
     FOOT_REGION_NAMES,
@@ -532,7 +564,7 @@ with st.expander("Automatic foot regions: hindfoot / midfoot / forefoot (plantar
     if st.checkbox("Preview the automatic foot mask with these settings"):
         try:
             preview_masks, preview_threshold = auto_segment()
-            st.image(
+            show_image(
                 overlay_masks(source_display, preview_masks),
                 caption=f"Segmented foot area (threshold {preview_threshold:.4g}). If it includes bedding or "
                 "misses toes, use the drawn-outline method below the canvas instead.",
@@ -746,11 +778,7 @@ st.dataframe(results[preferred_columns], use_container_width=True, hide_index=Tr
 if masks:
     st.subheader("Contour quality check")
     overlay = overlay_masks(source_display, masks)
-    st.image(
-        overlay,
-        caption="Verify that every colored outline matches the intended region.",
-        use_container_width=True,
-    )
+    show_image(overlay, caption="Verify that every colored outline matches the intended region.")
 else:
     overlay = ensure_rgb_uint8(source_display)
     st.info("Draw at least one closed contour to calculate contour-specific measurements.")
