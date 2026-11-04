@@ -1023,8 +1023,13 @@ def left_right_comparison(
     row_spacing: float = 1.0,
     column_spacing: float = 1.0,
     threshold: float | None = None,
+    side_a: str = "A",
+    side_b: str = "B",
 ) -> list[dict[str, Any]]:
     """Per-pair statistics and differences (A - B) between two ROIs.
+
+    `side_a` / `side_b` name what A and B are (for example "Right" and "Left");
+    they are recorded in every row together with the difference convention.
 
     pairs: (label, ROI_A, ROI_B) with 1-based ROI numbers. Differences use the
     valid (finite) pixels of each ROI. `area_difference_percent` is the
@@ -1043,7 +1048,14 @@ def left_right_comparison(
         stats_b = summary_statistics(values, masks[int(roi_b) - 1])
         geometry_a = roi_geometry(masks[int(roi_a) - 1], row_spacing=row_spacing, column_spacing=column_spacing)
         geometry_b = roi_geometry(masks[int(roi_b) - 1], row_spacing=row_spacing, column_spacing=column_spacing)
-        row: dict[str, Any] = {"region": label, "roi_a": int(roi_a), "roi_b": int(roi_b)}
+        row: dict[str, Any] = {
+            "region": label,
+            "roi_a": int(roi_a),
+            "roi_b": int(roi_b),
+            "side_a": side_a,
+            "side_b": side_b,
+            "difference_convention": f"{side_a} minus {side_b}",
+        }
         for key in ("mean", "median", "p95"):
             row[f"{key}_a"] = stats_a[key]
             row[f"{key}_b"] = stats_b[key]

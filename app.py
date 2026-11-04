@@ -875,9 +875,17 @@ if len(masks) >= 2:
     st.caption(
         "Pairs two ROIs and reports A minus B for mean, median and p95, plus the areas. For foot regions "
         "created by the app the pairs are filled in automatically (the same region on the first two feet); "
-        "after you add, delete or reorder contours, check the ROI numbers. Foot 1 is the foot on the left of "
-        "the image: decide yourself which side that is."
+        "after you add, delete or reorder contours, check the ROI numbers. ROI A is assumed to be the foot "
+        "on the left of the image and ROI B the foot on the right."
     )
+    left_of_image = st.radio(
+        "The foot on the left side of the image is the patient's",
+        ("Right foot", "Left foot"),
+        horizontal=True,
+        help="Plantar views taken with the patient lying down usually show the right foot on the left of "
+        "the image; set this to match your images.",
+    )
+    side_a, side_b = ("Right", "Left") if left_of_image == "Right foot" else ("Left", "Right")
     auto_labels = (st.session_state.get("auto_foot") or {}).get("labels")
     if (st.session_state.get("auto_foot") or {}).get("file_hash") != file_hash:
         auto_labels = None
@@ -914,7 +922,7 @@ if len(masks) >= 2:
     try:
         comparison_rows = left_right_comparison(
             values, masks, valid_pairs, row_spacing=row_spacing, column_spacing=column_spacing,
-            threshold=comparison_threshold,
+            threshold=comparison_threshold, side_a=side_a, side_b=side_b,
         )
     except ValueError as exc:
         st.warning(str(exc))
@@ -924,11 +932,27 @@ if len(masks) >= 2:
             ["region", "roi_a", "roi_b", "mean_a", "mean_b", "mean_difference", "median_difference",
              "p95_difference", "area_a", "area_b", "area_difference_percent"]
             + (["exceeds_threshold"] if comparison_threshold is not None else [])
-        ].rename(columns={"roi_a": "ROI A", "roi_b": "ROI B"})
+        ].rename(
+            columns={
+                "roi_a": f"ROI {side_a}",
+                "roi_b": f"ROI {side_b}",
+                "mean_a": f"mean {side_a}",
+                "mean_b": f"mean {side_b}",
+                "mean_difference": f"mean diff ({side_a} - {side_b})",
+                "median_difference": f"median diff ({side_a} - {side_b})",
+                "p95_difference": f"p95 diff ({side_a} - {side_b})",
+                "area_a": f"area {side_a}",
+                "area_b": f"area {side_b}",
+                "area_difference_percent": f"area diff % ({side_a} - {side_b})",
+            }
+        )
         st.dataframe(shown, use_container_width=True, hide_index=True)
         if (comparison["valid_pixels_a"] == 0).any() or (comparison["valid_pixels_b"] == 0).any():
             st.warning("At least one ROI has no valid (decoded) pixels, so its differences are NA.")
-        st.caption(f"Area unit: {spatial_unit}². Difference = A minus B (area difference is the symmetric percentage).")
+        st.caption(
+            f"Area unit: {spatial_unit}². Difference = {side_a} minus {side_b} (area difference is the symmetric "
+            "percentage). Check that the ROI numbers match the sides."
+        )
 
 if masks:
     st.subheader("Contour quality check")
@@ -997,7 +1021,8 @@ metadata = {
     "left_right_comparison": {
         "pairs": [[row["region"], row["roi_a"], row["roi_b"]] for row in comparison_rows],
         "threshold": comparison_threshold,
-        "convention": "difference = A minus B",
+        "convention": f"difference = {side_a} minus {side_b} (ROI A assumed on the image left)" if comparison_rows else None,
+        "foot_on_image_left": left_of_image if comparison_rows else None,
     },
 }
 

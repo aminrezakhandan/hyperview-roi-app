@@ -784,3 +784,13 @@ def test_default_pairs_from_foot_labels_and_fallbacks():
     assert default_region_pairs(None, 1) == [] and default_region_pairs(labels[:3], 1) == []
     one_foot = labels[:3]
     assert default_region_pairs(one_foot, 3) == [("Pair 1", 1, 2)]  # only one foot: no automatic pairing
+
+
+def test_left_right_side_labels_recorded_in_rows():
+    values, masks = _two_roi_scene()
+    (row,) = left_right_comparison(values, masks, [("Whole", 1, 2)], side_a="Right", side_b="Left")
+    assert (row["side_a"], row["side_b"]) == ("Right", "Left")
+    assert row["difference_convention"] == "Right minus Left"
+    assert row["mean_difference"] == pytest.approx(2.5)  # numbers unchanged by labels
+    (default,) = left_right_comparison(values, masks, [("Whole", 1, 2)])
+    assert default["difference_convention"] == "A minus B"
