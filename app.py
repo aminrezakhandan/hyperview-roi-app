@@ -5,9 +5,11 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import importlib
 import io
 import json
 import re
+import sys
 import zipfile
 from pathlib import Path
 
@@ -63,32 +65,52 @@ def show_image(array, caption: str = "", width: int | None = None, max_display_w
     else:
         st.image(data_url, caption=caption or None, use_container_width=True)
 
-from roi_core import (
-    FOOT_REGION_NAMES,
-    HEEL_SIDES,
-    SUPPORTED_COLORMAPS,
-    canvas_size,
-    decode_false_color,
-    default_morphology_radii,
-    default_region_pairs,
-    ensure_rgb_uint8,
-    flatten_alpha,
-    fit_feet,
-    left_right_comparison,
-    masks_from_canvas,
-    masks_to_fabric_drawing,
-    normalize_to_rgb,
-    otsu_threshold,
-    overlay_masks,
-    roi_geometry,
-    segment_feet,
-    split_foot_regions,
-    strict_threshold,
-    template_landmarks,
-    template_regions,
-    trim_nan_border,
-    summary_statistics,
-)
+try:
+    if "roi_core" in sys.modules:
+        # A long-lived server process can keep a stale copy of this module after a redeploy,
+        # which makes the new names below fail to import; reload it first.
+        importlib.reload(sys.modules["roi_core"])
+    from roi_core import (
+        FOOT_REGION_NAMES,
+        HEEL_SIDES,
+        SUPPORTED_COLORMAPS,
+        canvas_size,
+        decode_false_color,
+        default_morphology_radii,
+        default_region_pairs,
+        ensure_rgb_uint8,
+        flatten_alpha,
+        fit_feet,
+        left_right_comparison,
+        masks_from_canvas,
+        masks_to_fabric_drawing,
+        normalize_to_rgb,
+        otsu_threshold,
+        overlay_masks,
+        roi_geometry,
+        segment_feet,
+        split_foot_regions,
+        strict_threshold,
+        template_landmarks,
+        template_regions,
+        trim_nan_border,
+        summary_statistics,
+    )
+except ImportError as _import_error:
+    # Streamlit hides exception messages in the browser; show this one (it contains no user data).
+    _core = sys.modules.get("roi_core")
+    _core_file = getattr(_core, "__file__", None)
+    _core_info = "roi_core not imported"
+    if _core_file:
+        _core_bytes = Path(_core_file).read_bytes()
+        _core_info = f"{_core_file} ({len(_core_bytes)} bytes, sha256 {hashlib.sha256(_core_bytes).hexdigest()[:12]})"
+    st.error("The app could not start: a required module failed to import. Details:")
+    st.code(
+        f"{type(_import_error).__name__}: {_import_error}\n"
+        f"python {sys.version.split()[0]}, streamlit {st.__version__}\n"
+        f"{_core_info}"
+    )
+    st.stop()
 
 
 st.set_page_config(page_title="Multimodal ROI Analyzer", page_icon="🩻", layout="wide")
